@@ -62,6 +62,7 @@ SANDBOX_ALLOWED_TOOLS = frozenset([
     "web_search",
     "web_extract",
     "read_file",
+    "read_file_raw",
     "write_file",
     "search_files",
     "patch",
@@ -228,6 +229,12 @@ _TOOL_STUBS = {
         "path: str, offset: int = 1, limit: int = 500",
         '"""Read a file (1-indexed lines). Returns dict with "content" and "total_lines"."""',
         '{"path": path, "offset": offset, "limit": limit}',
+    ),
+    "read_file_raw": (
+        "read_file_raw",
+        "path: str",
+        '"""Read a file as raw text (no line numbers). Returns dict with "content" and "file_size"."""',
+        '{"path": path}',
     ),
     "write_file": (
         "write_file",

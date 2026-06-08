@@ -1999,8 +1999,9 @@ def run_conversation(
 
                     # Log API call details for debugging/observability
                     _cache_pct = ""
-                    if canonical_usage.cache_read_tokens and prompt_tokens:
-                        _cache_pct = f" cache={canonical_usage.cache_read_tokens}/{prompt_tokens} ({100*canonical_usage.cache_read_tokens/prompt_tokens:.0f}%)"
+                    if canonical_usage.cache_read_tokens and canonical_usage.input_tokens is not None:
+                        total_cache = canonical_usage.cache_read_tokens + canonical_usage.input_tokens
+                        _cache_pct = f" cache_hit={canonical_usage.cache_read_tokens}/{total_cache} ({100*canonical_usage.cache_read_tokens/max(1,total_cache):.0f}%)"
                     logger.info(
                         "API call #%d: model=%s provider=%s in=%d out=%d total=%d latency=%.1fs%s",
                         agent.session_api_calls, agent.model, agent.provider or "unknown",
@@ -3586,9 +3587,13 @@ def run_conversation(
                                 _retry_after = min(float(_ra_raw), 120)  # Cap at 2 minutes
                             except (TypeError, ValueError):
                                 pass
-                wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
+                wait_time = _retry_after if _retry_after else (
+                    jittered_backoff(retry_count, base_delay=3.0, max_delay=20.0)
+                    if is_rate_limited
+                    else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
+                )
                 if is_rate_limited:
-                    agent._buffer_status(f"⏱️ Rate limited. Waiting {wait_time:.1f}s (attempt {retry_count + 1}/{max_retries})...")
+                    agent._emit_status(f"⏱️ Rate limited. Waiting {wait_time:.1f}s (attempt {retry_count + 1}/{max_retries})...")
                 else:
                     agent._buffer_status(f"⏳ Retrying in {wait_time:.1f}s (attempt {retry_count}/{max_retries})...")
                 logger.warning(
@@ -3624,6 +3629,7 @@ def run_conversation(
                             f"error retry backoff ({retry_count}/{max_retries}), "
                             f"{int(sleep_end - time.time())}s remaining"
                         )
+                continue
         
         # If the API call was interrupted, skip response processing
         if interrupted:

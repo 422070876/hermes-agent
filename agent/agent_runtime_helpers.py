@@ -1339,6 +1339,7 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
         keepalive_http = agent._build_keepalive_http_client(client_kwargs.get("base_url", ""))
         if keepalive_http is not None:
             client_kwargs["http_client"] = keepalive_http
+        client_kwargs["max_retries"] = 0
     # Uses the module-level `OpenAI` name, resolved lazily on first
     # access via __getattr__ below. Tests patch via `run_agent.OpenAI`.
     client = _ra().OpenAI(**client_kwargs)
@@ -2044,24 +2045,24 @@ def copy_reasoning_content_for_api(agent, source_msg: dict, api_msg: dict) -> No
     if source_msg.get("role") != "assistant":
         return
 
-    # 1. Explicit reasoning_content already set — preserve it verbatim
-    # (includes DeepSeek/Kimi's own space-placeholder written at creation
-    # time, and any valid reasoning content from the same provider).
-    #
-    # Exception: sessions persisted BEFORE #17341 have empty-string
-    # placeholders pinned at creation time. DeepSeek V4 Pro rejects
-    # those with HTTP 400. When the active provider enforces the
-    # thinking-mode echo, upgrade "" → " " on replay so stale history
-    # doesn't 400 the user on the next turn.
-    existing = source_msg.get("reasoning_content")
-    if isinstance(existing, str):
-        if existing == "" and agent._needs_thinking_reasoning_pad():
-            api_msg["reasoning_content"] = " "
-        else:
-            api_msg["reasoning_content"] = existing
+    # reasoning_content is a response-only field. Re-sending it:
+    #   (a) burns billable prompt tokens (~500 tokens per reasoning turn)
+    #   (b) breaks the byte-stable prefix that DeepSeek's prompt cache relies on
+    #   (c) inflates every request with content the model doesn't need to re-read
+    # Only send it back when the provider strictly requires it for the next turn
+    # (DeepSeek / Kimi / MiMo thinking mode).
+    if not agent._needs_thinking_reasoning_pad():
+        api_msg.pop("reasoning_content", None)
         return
 
-    needs_thinking_pad = agent._needs_thinking_reasoning_pad()
+    # --- Providers that require reasoning_content echo-back ---
+    needs_thinking_pad = True
+
+    # 1. Explicit reasoning_content already set - preserve or pad it
+    existing = source_msg.get("reasoning_content")
+    if isinstance(existing, str):
+        api_msg["reasoning_content"] = " " if existing == "" else existing
+        return
 
     # 2. Cross-provider poisoned history (#15748): on DeepSeek/Kimi,
     # if the source turn has tool_calls AND a 'reasoning' field but no

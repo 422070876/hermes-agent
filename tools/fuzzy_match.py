@@ -69,6 +69,16 @@ def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
     if old_string == new_string:
         return content, 0, None, "old_string and new_string are identical"
 
+    # --- Truncation-artifact guard ---
+    # If old_string contains the read_file truncation marker, the model
+    # copied from a truncated display (not actual file content).
+    # Reject early so the model re-reads properly.
+    if "[TRUNCATED]" in old_string:
+        return content, 0, None, (
+            "old_string contains the \"..TRUNCATED\" truncation marker. "
+            "Use read_file_raw to get the full line, then retry."
+        )
+
     # Try each matching strategy in order
     strategies: List[Tuple[str, Callable]] = [
         ("exact", _strategy_exact),
@@ -107,6 +117,20 @@ def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
                 drift_err = _detect_escape_drift(content, matches, old_string, new_string)
                 if drift_err:
                     return content, 0, None, drift_err
+
+                # Content-similarity guard: after any non-exact match,
+                # verify that the matched region's text (with all
+                # whitespace stripped) still resembles old_string.
+                # Without this guard, strategies like context_aware can
+                # match a completely wrong location if old_string
+                # contains keywords that happen to appear elsewhere in
+                # the file (e.g. "insufficient_quota", "rate_limit").
+                if not _verify_match_content(content, matches, old_string):
+                    return content, 0, None, (
+                        f"Strategy '{strategy_name}' found a match but the matched "
+                        f"region's content does not resemble old_string. "
+                        f"Provide more unique context lines in old_string."
+                    )
 
             # Perform replacement. When the matched strategy is NOT `exact`,
             # the file's indentation may differ from what the LLM sent in
@@ -214,9 +238,11 @@ def _reindent_replacement(file_region: str, old_string: str, new_string: str) ->
 
     Approach:
 
-    1. For each non-blank line in ``new_string``, compute its indent
-       *relative* to the shallowest non-blank line of ``old_string`` (the
-       LLM's base indent).
+    1. Compute the LLM's "base" indent as the **mode** (most common)
+       non-blank-line indentation in ``old_string``. This is more robust
+       than using the first meaningful line, because LLM-generated
+       old_strings often have the first line at a different nesting level
+       than the rest of the block (e.g. a comment continuation line).
     2. Anchor that relative indent onto the file's actual base indent (the
        leading whitespace of the file_region's first non-blank line).
     3. Re-emit each non-blank line as ``file_base + (line_indent - llm_base)``.
@@ -227,17 +253,51 @@ def _reindent_replacement(file_region: str, old_string: str, new_string: str) ->
     No-op cases (returns ``new_string`` unchanged):
     - file_region or old_string has no meaningful line
     - LLM base indent equals file base indent
+    - file_region and old_string have different non-blank line counts
+      (indentation comparison would be meaningless)
+    - old_string has **inconsistent** indentation (non-blank lines span
+      more than 2 distinct leading-whitespace widths) — reindentation
+      would be unreliable, so skip it.
     - new_string is empty
     """
     if not new_string:
         return new_string
 
-    old_first = _first_meaningful_line(old_string)
-    file_first = _first_meaningful_line(file_region)
-    if old_first is None or file_first is None:
+    # Line-count guard: if file_region and old_string have different
+    # non-blank line counts, the fuzzy match may have hit wrong
+    # boundaries. Skip re-indentation to avoid corrupting the file.
+    _old_nb = sum(1 for ln in old_string.split("\n") if ln.strip())
+    _file_nb = sum(1 for ln in file_region.split("\n") if ln.strip())
+    if _old_nb != _file_nb:
         return new_string
 
-    old_indent = _leading_whitespace(old_first)
+    # Indentation-consistency guard: if old_string's non-blank lines
+    # span more than 2 distinct leading-whitespace widths, something is
+    # likely wrong with the match.  Skip reindentation to avoid
+    # corrupting the file with an unreliable baseline.
+    _old_lines = [ln for ln in old_string.split("\n") if ln.strip()]
+    _old_indents = {_leading_whitespace(ln) for ln in _old_lines}
+    if len(_old_indents) > 2:
+        return new_string
+
+    # Use the MODE (most common) non-blank-line indent as the baseline,
+    # not _first_meaningful_line.  LLM-generated old_strings often have
+    # the first line at a different nesting level than the rest of the
+    # block (comment continuation lines, etc.).
+    _indent_counts: dict[str, int] = {}
+    for ln in _old_lines:
+        ws = _leading_whitespace(ln)
+        _indent_counts[ws] = _indent_counts.get(ws, 0) + 1
+    # Tie-break: prefer the shallowest among equally frequent indents
+    # (the "base" indent is typically at or near the top of the block).
+    _max_count = max(_indent_counts.values())
+    _mode_indents = sorted(ws for ws, cnt in _indent_counts.items()
+                          if cnt == _max_count)
+    old_indent = _mode_indents[0]  # shallowest among the most common
+
+    file_first = _first_meaningful_line(file_region)
+    if file_first is None:
+        return new_string
     file_indent = _leading_whitespace(file_first)
 
     if old_indent == file_indent:
@@ -334,6 +394,36 @@ def _apply_replacements(content: str, matches: List[Tuple[int, int]],
         result = result[:start] + adjusted + result[end:]
 
     return result
+
+
+
+def _verify_match_content(content: str, matches: List[Tuple[int, int]],
+                           old_string: str) -> bool:
+    """Verify that the matched region of the file actually resembles old_string.
+
+    After a non-exact fuzzy match, the matched location could be completely
+    wrong if old_string contains generic keywords that appear elsewhere in
+    the file.  This function strips ALL whitespace from both the matched
+    region and old_string, then checks their overall SequenceMatcher ratio.
+
+    A ratio >= 0.40 is accepted (whitespace-stripped text can still differ
+    significantly in punctuation, quotes, and structure even when the
+    match is correct, especially after line_trimmed / indentation_flexible).
+    """
+    if not matches:
+        return False
+
+    matched_text = "".join(content[s:e] for s, e in matches)
+    old_flat = re.sub(r"\s+", "", old_string)
+    matched_flat = re.sub(r"\s+", "", matched_text)
+
+    # Quick length sanity check: matched region must be at least 40%
+    # as long as old_string (whitespace stripped).
+    if len(matched_flat) < len(old_flat) * 0.4:
+        return False
+
+    ratio = SequenceMatcher(None, old_flat, matched_flat).ratio()
+    return ratio >= 0.40
 
 
 # =============================================================================

@@ -790,7 +790,7 @@ class ShellFileOperations(FileOperations):
         for i, line in enumerate(lines, start=start_line):
             # Truncate long lines
             if len(line) > max_line_length:
-                line = line[:max_line_length] + "... [truncated]"
+                line = line[:max_line_length] + " \xe2\x80\xa6 [TRUNCATED]"
             numbered.append(f"{i}|{line}")
         return '\n'.join(numbered)
     
@@ -1016,6 +1016,8 @@ class ShellFileOperations(FileOperations):
         # chunk (the marker lives at byte 0); later pages can't carry it.
         if offset == 1:
             read_output, _ = _strip_bom(read_output)
+        if read_output:
+            read_output = _normalize_line_endings(read_output, "\n")
         
         # Get total line count
         wc_cmd = f"wc -l < {self._escape_shell_arg(path)}"
@@ -1126,6 +1128,10 @@ class ShellFileOperations(FileOperations):
         # back out — it re-probes the on-disk file, which still has the
         # marker — so the round-trip preserves it.
         raw_content, _ = _strip_bom(_strip_terminal_fence_leaks(cat_result.stdout))
+        # Normalize Windows CRLF to LF so fuzzy matching and string
+        # operations deal with clean text. write_file handles the
+        # reverse conversion (LF -> CRLF) on the way out.
+        raw_content = _normalize_line_endings(raw_content, "\n")
         return ReadResult(
             content=raw_content,
             file_size=file_size,

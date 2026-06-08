@@ -1386,6 +1386,48 @@ READ_FILE_SCHEMA = {
     }
 }
 
+READ_FILE_RAW_SCHEMA = {
+    "name": "read_file_raw",
+    "description": "Read an entire file as raw text (no line numbers, no pagination). "
+                   "Use this when you need to pass file content directly to write_file "
+                   "without line-number pollution. For large files, use read_file with offset/limit.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Path to the file to read (absolute, relative, or ~/path)"},
+        },
+        "required": ["path"]
+    }
+}
+
+READ_FILE_RAW_SCHEMA = {
+    "name": "read_file_raw",
+    "description": "Read an entire file as raw text (no line numbers, no pagination). "
+                   "Use this when you need to pass file content directly to write_file "
+                   "without line-number pollution. For large files, use read_file with offset/limit.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Path to the file to read (absolute, relative, or ~/path)"},
+        },
+        "required": ["path"]
+    }
+}
+
+READ_FILE_RAW_SCHEMA = {
+    "name": "read_file_raw",
+    "description": "Read an entire file as raw text (no line numbers, no pagination). "
+                   "Use this when you need to pass file content directly to write_file "
+                   "without line-number pollution. For large files, use read_file with offset/limit.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Path to the file to read (absolute, relative, or ~/path)"},
+        },
+        "required": ["path"]
+    }
+}
+
 WRITE_FILE_SCHEMA = {
     "name": "write_file",
     "description": "Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. OVERWRITES the entire file — use 'patch' for targeted edits. Auto-runs syntax checks on .py/.json/.yaml/.toml and other linted languages; only NEW errors introduced by this write are surfaced (pre-existing errors are filtered out).",
@@ -1480,6 +1522,16 @@ def _handle_read_file(args, **kw):
     return read_file_tool(path=args.get("path", ""), offset=args.get("offset", 1), limit=args.get("limit", 500), task_id=tid)
 
 
+def _handle_read_file_raw(args, **kw):
+    tid = kw.get("task_id") or "default"
+    path = args.get("path", "")
+    if not path:
+        return json.dumps({"error": "read_file_raw: missing required field 'path'"})
+    file_ops = _get_file_ops(tid)
+    result = file_ops.read_file_raw(path)
+    return json.dumps(result.to_dict(), ensure_ascii=False)
+
+
 def _handle_write_file(args, **kw):
     tid = kw.get("task_id") or "default"
     if not args.get("path") or not isinstance(args.get("path"), str):
@@ -1528,6 +1580,7 @@ def _handle_search_files(args, **kw):
 
 
 registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, handler=_handle_read_file, check_fn=_check_file_reqs, emoji="📖", max_result_size_chars=100_000)
+registry.register(name="read_file_raw", toolset="file", schema=READ_FILE_RAW_SCHEMA, handler=_handle_read_file_raw, check_fn=_check_file_reqs, emoji="📄", max_result_size_chars=100_000)
 registry.register(name="write_file", toolset="file", schema=WRITE_FILE_SCHEMA, handler=_handle_write_file, check_fn=_check_file_reqs, emoji="✍️", max_result_size_chars=100_000)
 registry.register(name="patch", toolset="file", schema=PATCH_SCHEMA, handler=_handle_patch, check_fn=_check_file_reqs, emoji="🔧", max_result_size_chars=100_000)
 registry.register(name="search_files", toolset="file", schema=SEARCH_FILES_SCHEMA, handler=_handle_search_files, check_fn=_check_file_reqs, emoji="🔎", max_result_size_chars=100_000)
