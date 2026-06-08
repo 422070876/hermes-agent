@@ -3133,21 +3133,25 @@ def browser_get_images(task_id: Optional[str] = None) -> str:
 
     effective_task_id = _last_session_key(task_id or "default")
 
-    # Use eval to run JavaScript that extracts images
-    js_code = """JSON.stringify(
-        [...document.images].map(img => ({
-            src: img.src,
-            alt: img.alt || '',
-            width: img.naturalWidth,
-            height: img.naturalHeight
-        })).filter(img => img.src && !img.src.startsWith('data:'))
-    )"""
+    # Single-line JS to avoid CLI arg truncation (multi-line gets mangled
+    # by agent-browser Rust binary) and to keep CDP backend compatibility.
+    # NOTE: agent-browser eval does NOT support arrow functions (=>),
+    # must use ES5-compatible IIFE with function() syntax.
+    js_code = (
+        "(function(){var r=[];var imgs=document.images;"
+        "for(var i=0;i<imgs.length;i++){var img=imgs[i];"
+        "if(img.src&&img.src.indexOf('data:')!==0){"
+        "r.push({src:img.src,alt:img.alt||'',"
+        "width:img.naturalWidth||0,height:img.naturalHeight||0})}}"
+        "return JSON.stringify(r)})()"
+    )
 
     result = _run_browser_command(effective_task_id, "eval", [js_code])
 
     if result.get("success"):
         data = result.get("data", {})
-        raw_result = data.get("result", "[]")
+        # agent-browser CLI → data.result, CDP backend console() → data.value
+        raw_result = data.get("result") or data.get("value") or "[]"
 
         try:
             # Parse the JSON string returned by JavaScript

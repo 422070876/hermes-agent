@@ -2,6 +2,13 @@
 
 > 让 Hermes Agent 在 Windows 上（Git Bash / WSL）正常工作的补丁包。
 
+| 项目 | 值 |
+|------|-----|
+| **基于上游版本** | [v0.16.0](https://github.com/NousResearch/hermes-agent) — commit `fa42ac094`（2026-06-07） |
+| **补丁更新日期** | 2026-06-08 |
+| **兼容范围** | Windows 10 / 11（Git Bash / MSYS2 / WSL） |
+| **GitHub 仓库** | https://github.com/422070876/hermes-agent/tree/windows-patches |
+
 ---
 
 ## 目录
@@ -34,7 +41,7 @@ pip install websockets
 ```bash
 git clone https://github.com/NousResearch/hermes-agent.git
 cd hermes-agent
-git checkout 79f7e7a1e
+git checkout fa42ac094  # Hermes Agent v0.16.0
 
 # 下载补丁包（如果已有 windows-patches 目录则跳过）
 mkdir -p windows-patches
@@ -100,6 +107,10 @@ Hermes Agent 默认针对 Linux/macOS 设计，在 Windows 上存在以下兼容
 1. **`_create_local_session()`** — Windows 上调用 `browser_cdp_backend.start_chrome_and_get_cdp_url()` 启动 Chrome 并获取 CDP URL
 2. **`_run_browser_command()`** — Windows 上通过 Python CDP 客户端路由命令，不走 `agent-browser`
 3. **新增 `_run_cdp_command()`** — CDP 命令分发函数，支持 open/snapshot/click/type/scroll/back/press/console/screenshot/get_images/eval/close
+
+**2026-06-08 更新**：`browser_get_images()` 的 JS 代码从箭头函数 (`=>`) 改为 ES5 兼容 IIFE。原因：agent-browser Rust 二进制的 `eval` 不支持箭头函数（语法解析错误），且 CDP 后端 `console()` 返回格式不同（`data.value` 而非 `data.result`）。改动：
+- JS 代码改为 ES5 单行 IIFE：`(function(){var r=[];...return JSON.stringify(r)})()`
+- `raw_result` 取值改为 `data.get("result") or data.get("value") or "[]"`，兼容两种后端返回格式
 
 ### 3.2 Git Bash 检测增强
 
@@ -310,6 +321,8 @@ write_file("copy.py", content)                  # 安全写入
   - 保留原有的**行数不一致保护**：`old_string` 和 `file_region` 非空行数不一致时跳过
 
 **效果**：五层防线：`read_file` 显示更醒目标记 → 模型不易误用 → 即使误用了，截断标记守卫在策略匹配前拒绝 → 即使漏网，内容相似度守卫拒绝无关区域的误匹配 → 即使再漏网，`_reindent_replacement` 用行数/缩进一致性双重兜底。patch 工具的缩进错误问题彻底解决。
+
+**2026-06-08 更新**：`_reindent_replacement()` 增强缩进对齐逻辑。当 `old_string` 缩进与文件一致时，LLM 生成的 `new_string` 首行可能因 tool-call 序列化丢失了前导空白。新增检测：统计 `new_string` 非空行的众数缩进，若与 `old_string` 缩进不同，按文件实际缩进重新对齐。解决了 `old_string` 缩进匹配但 `new_string` 缩进偏移的特殊场景。
 
 ### 3.15 技能搜索工具 — `find_skills`
 

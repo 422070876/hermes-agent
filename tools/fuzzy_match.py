@@ -299,10 +299,39 @@ def _reindent_replacement(file_region: str, old_string: str, new_string: str) ->
     if file_first is None:
         return new_string
     file_indent = _leading_whitespace(file_first)
-
     if old_indent == file_indent:
+        # Even when old_string matches the file's indent, new_string may use
+        # different indentation (e.g. LLM lost leading whitespace on the
+        # first line via tool-call serialization).  Compute new_string's own
+        # base indent and re-indent to the file's actual indent when they
+        # differ, so the replacement preserves the file's indent style.
+        _new_lines = [ln for ln in new_string.split("\n") if ln.strip()]
+        if _new_lines:
+            _new_indent_counts: dict[str, int] = {}
+            for ln in _new_lines:
+                ws = _leading_whitespace(ln)
+                _new_indent_counts[ws] = _new_indent_counts.get(ws, 0) + 1
+            _new_max = max(_new_indent_counts.values())
+            _new_mode = sorted(
+                ws for ws, cnt in _new_indent_counts.items() if cnt == _new_max
+            )
+            new_indent = _new_mode[0]
+            if new_indent != old_indent:
+                # Re-indent to file's actual indent using new_string's own
+                # base indent as the reference prefix.
+                out_lines: list[str] = []
+                for line in new_string.split("\n"):
+                    if not line.strip():
+                        out_lines.append(line)
+                        continue
+                    line_indent = _leading_whitespace(line)
+                    if line_indent.startswith(new_indent):
+                        remainder = line[len(new_indent):]
+                        out_lines.append(file_indent + remainder)
+                    else:
+                        out_lines.append(file_indent + line.lstrip(" \t"))
+                return "\n".join(out_lines)
         return new_string
-
     # Re-indent each line of new_string. Strategy: replace the LLM's base
     # indent prefix with the file's base indent prefix, preserving any
     # additional indent the LLM added on top. This is the same approach

@@ -1039,7 +1039,7 @@ index 3a745a604..f8b8a376e 100644
 +    # 1M input × ¥3/M + 500K output × ¥6/M = ¥3 + ¥3 = ¥6
 +    assert float(result.amount_usd) == 6.0
 diff --git a/tools/browser_tool.py b/tools/browser_tool.py
-index 66684b8ee..9f29793fe 100644
+index 66684b8ee..f186f72dc 100644
 --- a/tools/browser_tool.py
 +++ b/tools/browser_tool.py
 @@ -1625,7 +1625,28 @@ BROWSER_TOOL_SCHEMAS = [
@@ -1180,6 +1180,42 @@ index 66684b8ee..9f29793fe 100644
  def _extract_relevant_content(
      snapshot_text: str,
      user_task: Optional[str] = None
+@@ -3025,21 +3133,25 @@ def browser_get_images(task_id: Optional[str] = None) -> str:
+ 
+     effective_task_id = _last_session_key(task_id or "default")
+ 
+-    # Use eval to run JavaScript that extracts images
+-    js_code = """JSON.stringify(
+-        [...document.images].map(img => ({
+-            src: img.src,
+-            alt: img.alt || '',
+-            width: img.naturalWidth,
+-            height: img.naturalHeight
+-        })).filter(img => img.src && !img.src.startsWith('data:'))
+-    )"""
++    # Single-line JS to avoid CLI arg truncation (multi-line gets mangled
++    # by agent-browser Rust binary) and to keep CDP backend compatibility.
++    # NOTE: agent-browser eval does NOT support arrow functions (=>),
++    # must use ES5-compatible IIFE with function() syntax.
++    js_code = (
++        "(function(){var r=[];var imgs=document.images;"
++        "for(var i=0;i<imgs.length;i++){var img=imgs[i];"
++        "if(img.src&&img.src.indexOf('data:')!==0){"
++        "r.push({src:img.src,alt:img.alt||'',"
++        "width:img.naturalWidth||0,height:img.naturalHeight||0})}}"
++        "return JSON.stringify(r)})()"
++    )
+ 
+     result = _run_browser_command(effective_task_id, "eval", [js_code])
+ 
+     if result.get("success"):
+         data = result.get("data", {})
+-        raw_result = data.get("result", "[]")
++        # agent-browser CLI → data.result, CDP backend console() → data.value
++        raw_result = data.get("result") or data.get("value") or "[]"
+ 
+         try:
+             # Parse the JSON string returned by JavaScript
 diff --git a/tools/code_execution_tool.py b/tools/code_execution_tool.py
 index 40581e57f..399841501 100644
 --- a/tools/code_execution_tool.py
@@ -1675,7 +1711,7 @@ index 45186ae6c..4685ffc4b 100644
  registry.register(name="patch", toolset="file", schema=PATCH_SCHEMA, handler=_handle_patch, check_fn=_check_file_reqs, emoji="🔧", max_result_size_chars=100_000)
  registry.register(name="search_files", toolset="file", schema=SEARCH_FILES_SCHEMA, handler=_handle_search_files, check_fn=_check_file_reqs, emoji="🔎", max_result_size_chars=100_000)
 diff --git a/tools/fuzzy_match.py b/tools/fuzzy_match.py
-index b6991e7a2..15ac99a02 100644
+index b6991e7a2..f07f17533 100644
 --- a/tools/fuzzy_match.py
 +++ b/tools/fuzzy_match.py
 @@ -69,6 +69,16 @@ def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
@@ -1731,7 +1767,7 @@ index b6991e7a2..15ac99a02 100644
      2. Anchor that relative indent onto the file's actual base indent (the
         leading whitespace of the file_region's first non-blank line).
      3. Re-emit each non-blank line as ``file_base + (line_indent - llm_base)``.
-@@ -227,17 +253,51 @@ def _reindent_replacement(file_region: str, old_string: str, new_string: str) ->
+@@ -227,22 +253,85 @@ def _reindent_replacement(file_region: str, old_string: str, new_string: str) ->
      No-op cases (returns ``new_string`` unchanged):
      - file_region or old_string has no meaningful line
      - LLM base indent equals file base indent
@@ -1757,6 +1793,7 @@ index b6991e7a2..15ac99a02 100644
          return new_string
  
 -    old_indent = _leading_whitespace(old_first)
+-    file_indent = _leading_whitespace(file_first)
 +    # Indentation-consistency guard: if old_string's non-blank lines
 +    # span more than 2 distinct leading-whitespace widths, something is
 +    # likely wrong with the match.  Skip reindentation to avoid
@@ -1765,7 +1802,7 @@ index b6991e7a2..15ac99a02 100644
 +    _old_indents = {_leading_whitespace(ln) for ln in _old_lines}
 +    if len(_old_indents) > 2:
 +        return new_string
-+
+ 
 +    # Use the MODE (most common) non-blank-line indent as the baseline,
 +    # not _first_meaningful_line.  LLM-generated old_strings often have
 +    # the first line at a different nesting level than the rest of the
@@ -1784,10 +1821,45 @@ index b6991e7a2..15ac99a02 100644
 +    file_first = _first_meaningful_line(file_region)
 +    if file_first is None:
 +        return new_string
-     file_indent = _leading_whitespace(file_first)
- 
++    file_indent = _leading_whitespace(file_first)
      if old_indent == file_indent:
-@@ -336,6 +396,36 @@ def _apply_replacements(content: str, matches: List[Tuple[int, int]],
++        # Even when old_string matches the file's indent, new_string may use
++        # different indentation (e.g. LLM lost leading whitespace on the
++        # first line via tool-call serialization).  Compute new_string's own
++        # base indent and re-indent to the file's actual indent when they
++        # differ, so the replacement preserves the file's indent style.
++        _new_lines = [ln for ln in new_string.split("\n") if ln.strip()]
++        if _new_lines:
++            _new_indent_counts: dict[str, int] = {}
++            for ln in _new_lines:
++                ws = _leading_whitespace(ln)
++                _new_indent_counts[ws] = _new_indent_counts.get(ws, 0) + 1
++            _new_max = max(_new_indent_counts.values())
++            _new_mode = sorted(
++                ws for ws, cnt in _new_indent_counts.items() if cnt == _new_max
++            )
++            new_indent = _new_mode[0]
++            if new_indent != old_indent:
++                # Re-indent to file's actual indent using new_string's own
++                # base indent as the reference prefix.
++                out_lines: list[str] = []
++                for line in new_string.split("\n"):
++                    if not line.strip():
++                        out_lines.append(line)
++                        continue
++                    line_indent = _leading_whitespace(line)
++                    if line_indent.startswith(new_indent):
++                        remainder = line[len(new_indent):]
++                        out_lines.append(file_indent + remainder)
++                    else:
++                        out_lines.append(file_indent + line.lstrip(" \t"))
++                return "\n".join(out_lines)
+         return new_string
+-
+     # Re-indent each line of new_string. Strategy: replace the LLM's base
+     # indent prefix with the file's base indent prefix, preserving any
+     # additional indent the LLM added on top. This is the same approach
+@@ -336,6 +425,36 @@ def _apply_replacements(content: str, matches: List[Tuple[int, int]],
      return result
  
  
