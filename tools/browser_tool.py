@@ -1752,7 +1752,28 @@ BROWSER_TOOL_SCHEMAS = [
 
 def _create_local_session(task_id: str) -> Dict[str, str]:
     import uuid
+    import socket
     session_name = f"h_{uuid.uuid4().hex[:10]}"
+    # On Windows, agent-browser --session mode hangs when launching Chrome.
+    # Instead, start Chrome with --remote-debugging-port ourselves and
+    # connect via the Python CDP backend (which replaces agent-browser entirely).
+    if os.name == "nt":
+        try:
+            from tools.browser_cdp_backend import start_chrome_and_get_cdp_url
+            cdp_url = start_chrome_and_get_cdp_url(task_id, session_name)
+            if cdp_url:
+                logger.info("Started local Chrome -> CDP on task %s session %s",
+                            task_id, session_name)
+                return {
+                    "session_name": session_name,
+                    "bb_session_id": None,
+                    "cdp_url": cdp_url,
+                    "features": {"local": True, "cdp_on_windows": True},
+                }
+        except Exception as win_err:
+            logger.warning("Failed to start local Chrome on Windows: %s", win_err)
+
+    # Fallback: original --session mode (non-Windows or Chrome launch failed)
     logger.info("Created local browser session %s for task %s",
                 session_name, task_id)
     return {
@@ -2075,10 +2096,37 @@ def _run_browser_command(
     # Local mode: --session <name> launches a local headless Chromium.
     # The rest of the command (--json, command, args) is identical.
     if session_info.get("cdp_url"):
-        # Cloud mode — connect to remote Browserbase browser via CDP
-        # IMPORTANT: Do NOT use --session with --cdp. In agent-browser >=0.13,
-        # --session creates a local browser instance and silently ignores --cdp.
-        backend_args = ["--cdp", session_info["cdp_url"]]
+        if os.name == "nt":
+            # On Windows, agent-browser's Rust daemon has a fundamental CDP
+            # communication bug — it can't talk to Chrome via CDP.  Use the
+            # Python CDP backend directly instead of the agent-browser CLI.
+            from tools.browser_cdp_backend import get_or_create_client, cleanup_chrome_for_task
+            client = get_or_create_client(task_id, session_info["cdp_url"])
+            result = _run_cdp_command(client, command, args)
+            # Auto-recovery: if CDP connection died (Chrome crash/Windows
+            # network error), clean up the stale session and retry once with
+            # a fresh Chrome instance.
+            if not result.get("success") and any(
+                kw in str(result.get("error", "")).lower()
+                for kw in ["close frame", "connectionclosed",
+                           "winerror", "cdp not connected",
+                           "reconnect fail", "cdp connect timeout"]
+            ):
+                logger.warning("CDP lost for task %s, restarting Chrome...", task_id)
+                cleanup_chrome_for_task(task_id)
+                with _cleanup_lock:
+                    _active_sessions.pop(task_id, None)
+                    _session_last_activity.pop(task_id, None)
+                session_info = _get_session_info(task_id)
+                if session_info.get("cdp_url"):
+                    client = get_or_create_client(task_id, session_info["cdp_url"])
+                    return _run_cdp_command(client, command, args)
+            return result
+        else:
+            # Cloud mode — connect to remote Browserbase browser via CDP
+            # IMPORTANT: Do NOT use --session with --cdp. In agent-browser >=0.13,
+            # --session creates a local browser instance and silently ignores --cdp.
+            backend_args = ["--cdp", session_info["cdp_url"]]
     else:
         # Local mode — launch a headless Chromium instance
         backend_args = ["--session", session_info["session_name"]]
@@ -2322,6 +2370,66 @@ def _run_browser_command(
         return _annotate_lightpanda_fallback(fallback_result, fallback_reason)
 
     return result
+
+
+def _run_cdp_command(
+    client,
+    command: str,
+    args: Optional[list] = None,
+) -> dict:
+    """Run a browser command via the Python CDP backend."""
+    args = args or []
+    try:
+        if command == "open":
+            url = args[0] if args else "about:blank"
+            return client.navigate(url)
+        elif command == "snapshot":
+            return client.snapshot()
+        elif command == "click":
+            ref = args[0] if args else ""
+            return client.click(ref)
+        elif command == "type":
+            ref = args[0] if args else ""
+            text = args[1] if len(args) > 1 else ""
+            return client.type_text(ref, text)
+        elif command == "fill":
+            ref = args[0] if args else ""
+            text = args[1] if len(args) > 1 else ""
+            return client.type_text(ref, text)
+        elif command == "scroll":
+            direction = args[0] if args else "down"
+            return client.scroll(direction)
+        elif command == "back":
+            return client.back()
+        elif command == "press":
+            key = args[0] if args else ""
+            return client.press_key(key)
+        elif command == "console":
+            expr = None
+            for i, a in enumerate(args):
+                if a.startswith("--expression="):
+                    expr = a[len("--expression="):]
+                elif a == "--expression" and i + 1 < len(args):
+                    expr = args[i + 1]
+                elif a == "expression" and i + 1 < len(args):
+                    expr = args[i + 1]
+            return client.console(expr)
+        elif command == "errors":
+            return client.console(None)
+        elif command == "screenshot":
+            return client.screenshot()
+        elif command in ("get_images", "images"):
+            return client.get_images()
+        elif command == "eval":
+            expr = args[0] if args else ""
+            return client.console(expr)
+        elif command == "close":
+            return {"success": True, "data": {}}
+        else:
+            return {"success": False, "error": f"Unknown CDP command: {command}"}
+    except Exception as e:
+        logger.warning("CDP command '%s' failed: %s", command, e, exc_info=True)
+        return {"success": False, "error": str(e)}
 
 
 def _extract_relevant_content(
@@ -3152,21 +3260,25 @@ def browser_get_images(task_id: Optional[str] = None) -> str:
 
     effective_task_id = _last_session_key(task_id or "default")
 
-    # Use eval to run JavaScript that extracts images
-    js_code = """JSON.stringify(
-        [...document.images].map(img => ({
-            src: img.src,
-            alt: img.alt || '',
-            width: img.naturalWidth,
-            height: img.naturalHeight
-        })).filter(img => img.src && !img.src.startsWith('data:'))
-    )"""
+    # Single-line JS to avoid CLI arg truncation (multi-line gets mangled
+    # by agent-browser Rust binary) and to keep CDP backend compatibility.
+    # NOTE: agent-browser eval does NOT support arrow functions (=>),
+    # must use ES5-compatible IIFE with function() syntax.
+    js_code = (
+        "(function(){var r=[];var imgs=document.images;"
+        "for(var i=0;i<imgs.length;i++){var img=imgs[i];"
+        "if(img.src&&img.src.indexOf('data:')!==0){"
+        "r.push({src:img.src,alt:img.alt||'',"
+        "width:img.naturalWidth||0,height:img.naturalHeight||0})}}"
+        "return JSON.stringify(r)})()"
+    )
 
     result = _run_browser_command(effective_task_id, "eval", [js_code])
 
     if result.get("success"):
         data = result.get("data", {})
-        raw_result = data.get("result", "[]")
+        # agent-browser CLI → data.result, CDP backend console() → data.value
+        raw_result = data.get("result") or data.get("value") or "[]"
 
         try:
             # Parse the JSON string returned by JavaScript

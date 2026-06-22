@@ -355,6 +355,13 @@ def interruptible_api_call(agent, api_kwargs: dict):
     _call_start = time.time()
     agent._touch_activity("waiting for non-streaming API response")
 
+    # simple_mode: call directly in current thread, no threading needed
+    if getattr(agent, "_simple_mode", False):
+        _call()
+        if result["error"] is not None:
+            raise result["error"]
+        return result["response"]
+
     t = threading.Thread(target=_call, daemon=True)
     t.start()
     _poll_count = 0
@@ -1706,9 +1713,16 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     on_tool_start=_on_tool,
                     on_reasoning_delta=_on_reasoning if agent.reasoning_callback or agent.stream_delta_callback else None,
                     on_interrupt_check=lambda: agent._interrupt_requested,
-                )
+)
             except Exception as e:
                 result["error"] = e
+
+        # simple_mode: call directly, no threading
+        if getattr(agent, "_simple_mode", False):
+            _bedrock_call()
+            if result["error"] is not None:
+                raise result["error"]
+            return result["response"]
 
         t = threading.Thread(target=_bedrock_call, daemon=True)
         t.start()
@@ -2561,6 +2575,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             _stream_stale_timeout = max(_stream_stale_timeout_base, 240.0)
         else:
             _stream_stale_timeout = _stream_stale_timeout_base
+
+    # simple_mode: call directly, no threading
+    if getattr(agent, "_simple_mode", False):
+        _call()
+        if result["response"] is not None:
+            return result["response"]
+        if result["error"] is not None:
+            raise result["error"]
 
     t = threading.Thread(target=_call, daemon=True)
     t.start()

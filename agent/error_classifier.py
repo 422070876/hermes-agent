@@ -1099,8 +1099,20 @@ def _classify_by_error_code(
             should_rotate_credential=True,
         )
 
+    # insufficient_quota may be a genuine billing issue (OpenAI) or a
+    # per-model daily quota / rate-limit (DashScope, etc.).
+    # Treat it as rate_limit by default so that retry-with-backoff happens
+    # instead of immediate credential exhaustion. The credential pool's
+    # own exhaustion detection handles the true-billing case via
+    # consecutive 429 counts (#11314).
+    if code_lower in {"insufficient_quota"}:
+        return result_fn(
+            FailoverReason.rate_limit,
+            retryable=True,
+            should_rotate_credential=True,
+        )
+
     if code_lower in {
-        "insufficient_quota",
         "billing_not_active",
         "payment_required",
         "insufficient_credits",

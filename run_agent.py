@@ -425,6 +425,7 @@ class AIAgent:
         checkpoint_max_total_size_mb: int = 500,
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
+        simple_mode: bool = False,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         from agent.agent_init import init_agent
@@ -500,6 +501,7 @@ class AIAgent:
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
+            simple_mode=simple_mode,
         )
 
     def _get_session_db_for_recall(self):
@@ -5197,11 +5199,10 @@ class AIAgent:
         # Allow _vprint during tool execution even with stream consumers
         self._executing_tools = True
         try:
-            if not _should_parallelize_tool_batch(tool_calls):
+            if self._simple_mode or not _should_parallelize_tool_batch(tool_calls):
                 return self._execute_tool_calls_sequential(
                     assistant_message, messages, effective_task_id, api_call_count
                 )
-
             return self._execute_tool_calls_concurrent(
                 assistant_message, messages, effective_task_id, api_call_count
             )

@@ -885,6 +885,7 @@ DEFAULT_CONFIG = {
     "providers": {},
     "fallback_providers": [],
     "credential_pool_strategies": {},
+    "custom_pricing": {},
     "toolsets": ["hermes-cli"],
     # Global active chat session cap across CLI, TUI/dashboard, and messaging.
     # None/0 = unbounded.
@@ -1014,6 +1015,7 @@ DEFAULT_CONFIG = {
         # only controls how inbound user images are presented.
         "image_input_mode": "auto",
         "disabled_toolsets": [],
+        "simple_mode": False,
     },
     
     "terminal": {

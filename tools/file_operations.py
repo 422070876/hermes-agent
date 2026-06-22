@@ -455,7 +455,8 @@ class FileOperations(ABC):
 
     @abstractmethod
     def patch_replace(self, path: str, old_string: str, new_string: str,
-                      replace_all: bool = False) -> PatchResult:
+                      replace_all: bool = False,
+                      fix_indent_from_old: bool = False) -> PatchResult:
         """Replace text in a file using fuzzy matching."""
         ...
 
@@ -888,7 +889,7 @@ class ShellFileOperations(FileOperations):
         for i, line in enumerate(lines, start=start_line):
             # Truncate long lines
             if len(line) > max_line_length:
-                line = line[:max_line_length] + "... [truncated]"
+                line = line[:max_line_length] + " \xe2\x80\xa6 [TRUNCATED]"
             numbered.append(f"{i}|{line}")
         return '\n'.join(numbered)
     
@@ -1114,6 +1115,8 @@ class ShellFileOperations(FileOperations):
         # chunk (the marker lives at byte 0); later pages can't carry it.
         if offset == 1:
             read_output, _ = _strip_bom(read_output)
+        if read_output:
+            read_output = _normalize_line_endings(read_output, "\n")
         
         # Get total line count
         wc_cmd = f"wc -l < {self._escape_shell_arg(path)}"
@@ -1224,6 +1227,10 @@ class ShellFileOperations(FileOperations):
         # back out — it re-probes the on-disk file, which still has the
         # marker — so the round-trip preserves it.
         raw_content, _ = _strip_bom(_strip_terminal_fence_leaks(cat_result.stdout))
+        # Normalize Windows CRLF to LF so fuzzy matching and string
+        # operations deal with clean text. write_file handles the
+        # reverse conversion (LF -> CRLF) on the way out.
+        raw_content = _normalize_line_endings(raw_content, "\n")
         return ReadResult(
             content=raw_content,
             file_size=file_size,
@@ -1463,7 +1470,8 @@ class ShellFileOperations(FileOperations):
     # =========================================================================
     
     def patch_replace(self, path: str, old_string: str, new_string: str,
-                      replace_all: bool = False) -> PatchResult:
+                      replace_all: bool = False,
+                      fix_indent_from_old: bool = False) -> PatchResult:
         """
         Replace text in a file using fuzzy matching.
 
@@ -1472,6 +1480,8 @@ class ShellFileOperations(FileOperations):
             old_string: Text to find (must be unique unless replace_all=True)
             new_string: Replacement text
             replace_all: If True, replace all occurrences
+            fix_indent_from_old: When True and new_string has no first-line indent,
+                restore it from old_string's first-line indent
 
         Returns:
             PatchResult with diff and lint results
@@ -1502,7 +1512,8 @@ class ShellFileOperations(FileOperations):
         from tools.fuzzy_match import fuzzy_find_and_replace
         
         new_content, match_count, _strategy, error = fuzzy_find_and_replace(
-            content, old_string, new_string, replace_all
+            content, old_string, new_string, replace_all,
+            fix_indent_from_old=fix_indent_from_old,
         )
         
         if error or match_count == 0:

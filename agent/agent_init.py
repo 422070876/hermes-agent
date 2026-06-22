@@ -223,7 +223,8 @@ def init_agent(
     checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
-):
+    simple_mode: bool = False,
+    ):
     """
     Initialize the AI Agent.
 
@@ -406,13 +407,16 @@ def init_agent(
     # each message leaks one OS thread and the process eventually exhausts
     # the system thread limit (RuntimeError: can't start new thread).
     if (agent.provider == "openrouter" or agent._is_openrouter_url()) and \
-            not _ra()._openrouter_prewarm_done.is_set():
+            not _ra()._openrouter_prewarm_done.is_set() and \
+            not simple_mode:
         _ra()._openrouter_prewarm_done.set()
         threading.Thread(
             target=fetch_model_metadata,
             daemon=True,
             name="openrouter-prewarm",
         ).start()
+
+    agent._simple_mode = simple_mode
 
     agent.tool_progress_callback = tool_progress_callback
     agent.tool_start_callback = tool_start_callback

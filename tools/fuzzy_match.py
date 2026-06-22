@@ -48,7 +48,8 @@ def _unicode_normalize(text: str) -> str:
 
 
 def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
-                            replace_all: bool = False) -> Tuple[str, int, Optional[str], Optional[str]]:
+                            replace_all: bool = False,
+                            fix_indent_from_old: bool = False) -> Tuple[str, int, Optional[str], Optional[str]]:
     """
     Find and replace text using a chain of increasingly fuzzy matching strategies.
 
@@ -57,6 +58,8 @@ def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
         old_string: The text to find
         new_string: The replacement text
         replace_all: If True, replace all occurrences; if False, require uniqueness
+        fix_indent_from_old: When True and new_string has no first-line indent,
+            restore it from old_string's first-line indent (for .rej copy-paste loss).
 
     Returns:
         Tuple of (new_content, match_count, strategy_name, error_message)
@@ -68,6 +71,51 @@ def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
 
     if old_string == new_string:
         return content, 0, None, "old_string and new_string are identical"
+
+    # --- Truncation-artifact guard ---
+    # If old_string contains the read_file truncation marker, the model
+    # copied from a truncated display (not actual file content).
+    # Reject early so the model re-reads properly.
+    if "[TRUNCATED]" in old_string:
+        return content, 0, None, (
+            "old_string contains the \"..TRUNCATED\" truncation marker. "
+            "Use read_file_raw to get the full line, then retry."
+        )
+
+# --- First-line indent preservation ---
+    # Save new_string's first-line leading whitespace; strip old_string's
+    # first-line indent for matching, then apply new_string's indent to
+    # the replacement so the user's intended indentation is preserved.
+    _saved_indent = ""
+    _first = _first_meaningful_line(new_string)
+    if _first:
+        _ws = _leading_whitespace(_first)
+        if _ws:
+            _saved_indent = _ws
+            _lines = old_string.split("\n")
+            for _i, _line in enumerate(_lines):
+                if _line.strip():
+                    _lines[_i] = _line.lstrip(" \t")
+                    break
+            old_string = "\n".join(_lines)
+
+    # --- Fix indent from old_string when new_string lost its indent ---
+    if fix_indent_from_old and not _saved_indent:
+        fixed = _fix_indent_from_old_string(old_string, new_string)
+        if fixed != new_string:
+            new_string = fixed
+            # Re-run indent preservation with the fixed new_string
+            _first = _first_meaningful_line(new_string)
+            if _first:
+                _ws = _leading_whitespace(_first)
+                if _ws:
+                    _saved_indent = _ws
+                    _lines = old_string.split("\n")
+                    for _i, _line in enumerate(_lines):
+                        if _line.strip():
+                            _lines[_i] = _line.lstrip(" \t")
+                            break
+                    old_string = "\n".join(_lines)
 
     # Try each matching strategy in order
     strategies: List[Tuple[str, Callable]] = [
@@ -108,6 +156,20 @@ def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
                 if drift_err:
                     return content, 0, None, drift_err
 
+                # Content-similarity guard: after any non-exact match,
+                # verify that the matched region's text (with all
+                # whitespace stripped) still resembles old_string.
+                # Without this guard, strategies like context_aware can
+                # match a completely wrong location if old_string
+                # contains keywords that happen to appear elsewhere in
+                # the file (e.g. "insufficient_quota", "rate_limit").
+                if not _verify_match_content(content, matches, old_string):
+                    return content, 0, None, (
+                        f"Strategy '{strategy_name}' found a match but the matched "
+                        f"region's content does not resemble old_string. "
+                        f"Provide more unique context lines in old_string."
+                    )
+
             # Perform replacement. When the matched strategy is NOT `exact`,
             # the file's indentation may differ from what the LLM sent in
             # old_string/new_string — e.g. LLM used 2-space indent but the
@@ -131,12 +193,58 @@ def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
             # ``\n`` is intentionally excluded: newlines serialize correctly
             # through JSON, and rewriting backslash-n would mangle escape
             # sequences in source code constants far more often than help.
+            # When old_string had first-line indent stripped for matching,
+            # expand each match start backward to the beginning of its line
+            # so the file's original first-line indent is also replaced.
+            if _saved_indent:
+                _bol_matches = []
+                for _s, _e in matches:
+                    _bol = content.rfind("\n", 0, _s)
+                    _bol = (_bol + 1) if _bol != -1 else 0
+                    _bol_matches.append((_bol, _e))
+                matches = _bol_matches
+
+            # --- Fallback: restore indent from file content ---
+            # When both old_string and new_string lost their first-line indent
+            # (e.g. both copied from a .rej file whose unified-diff format
+            # stripped common leading whitespace), extract the indent from
+            # the actual file line at match position and apply it to
+            # new_string's first meaningful line.  Without this, a 0-indent
+            # new_string replaces a properly-indented line and corrupts it.
+            if not _saved_indent:
+                _s, _ = matches[0]
+                _bol = content.rfind("\n", 0, _s)
+                _bol = (_bol + 1) if _bol != -1 else 0
+                _eol = content.find("\n", _s)
+                _eol = _eol if _eol != -1 else len(content)
+                _file_line = content[_bol:_eol]
+                _file_indent_sp = _leading_whitespace(_file_line)
+                if _file_indent_sp:
+                    _new_first = _first_meaningful_line(new_string)
+                    if _new_first and not _leading_whitespace(_new_first):
+                        _saved_indent = _file_indent_sp
+                        # Expand matches to BOL so _apply_replacements
+                        # covers the file's existing indent as well.
+                        _bol_matches = []
+                        for _s2, _e2 in matches:
+                            _bol2 = content.rfind("\n", 0, _s2)
+                            _bol2 = (_bol2 + 1) if _bol2 != -1 else 0
+                            _bol_matches.append((_bol2, _e2))
+                        matches = _bol_matches
+
             effective_new = _maybe_unescape_new_string(
                 new_string, content, matches,
             )
+            # If new_string had first-line indent, prepend it to new_string's\n            # first line (replacing the file's original indent at the\n            # BOL-expanded match region).
+            if _saved_indent:
+                _nlines = effective_new.split("\n")
+                for _i, _line in enumerate(_nlines):
+                    if _line.strip():
+                        _nlines[_i] = _saved_indent + _line.lstrip(" \t")
+                        break
+                effective_new = "\n".join(_nlines)
             new_content = _apply_replacements(
                 content, matches, effective_new,
-                old_string=old_string if strategy_name != "exact" else None,
             )
             return new_content, len(matches), strategy_name, None
 
@@ -203,69 +311,38 @@ def _first_meaningful_line(text: str) -> Optional[str]:
     return None
 
 
-def _reindent_replacement(file_region: str, old_string: str, new_string: str) -> str:
-    """Adjust ``new_string`` so its indentation matches ``file_region``.
+def _fix_indent_from_old_string(old_string: str, new_string: str) -> str:
+    """When new_string's first line has no indent but old_string does,
+    prepend old_string's first-line indent to every line of new_string.
 
-    Used after a non-exact fuzzy match: the LLM may have sent old_string and
-    new_string with a different indent than the file actually has (e.g.
-    2-space indent in tool args vs 4-space indent on disk). The fuzzy
-    strategy successfully matched anyway, but writing ``new_string`` verbatim
-    would corrupt the file's indentation.
+    Use this when you know new_string lost its indentation during
+    copy/paste (e.g. from a reject diff) and want to restore it from
+    the old_string reference.  ``fuzzy_find_and_replace``'s
+    ``fix_indent_from_old`` parameter calls this automatically.
 
-    Approach:
-
-    1. For each non-blank line in ``new_string``, compute its indent
-       *relative* to the shallowest non-blank line of ``old_string`` (the
-       LLM's base indent).
-    2. Anchor that relative indent onto the file's actual base indent (the
-       leading whitespace of the file_region's first non-blank line).
-    3. Re-emit each non-blank line as ``file_base + (line_indent - llm_base)``.
-
-    Blank lines and lines less-indented than the LLM's base are anchored
-    directly to the file's base indent.
-
-    No-op cases (returns ``new_string`` unchanged):
-    - file_region or old_string has no meaningful line
-    - LLM base indent equals file base indent
-    - new_string is empty
+    Returns ``new_string`` unchanged when old_string has no indent or
+    new_string already has indent (nothing to fix).
     """
-    if not new_string:
-        return new_string
-
     old_first = _first_meaningful_line(old_string)
-    file_first = _first_meaningful_line(file_region)
-    if old_first is None or file_first is None:
+    if not old_first:
         return new_string
-
     old_indent = _leading_whitespace(old_first)
-    file_indent = _leading_whitespace(file_first)
-
-    if old_indent == file_indent:
+    if not old_indent:
         return new_string
 
-    # Re-indent each line of new_string. Strategy: replace the LLM's base
-    # indent prefix with the file's base indent prefix, preserving any
-    # additional indent the LLM added on top. This is the same approach
-    # Roo Code uses (multi-search-replace.ts:466-500). It preserves the
-    # LLM's intended *relative* nesting between lines while anchoring to
-    # the file's actual indent style.
-    out_lines: List[str] = []
-    for line in new_string.split("\n"):
-        if not line.strip():
-            # Blank lines: leave whitespace untouched.
-            out_lines.append(line)
-            continue
-        line_indent = _leading_whitespace(line)
-        if line_indent.startswith(old_indent):
-            # Common case: line has the LLM's base indent (possibly plus
-            # extra). Swap base prefix for the file's base prefix.
-            remainder = line[len(old_indent):]
-            out_lines.append(file_indent + remainder)
+    # Check that new_string actually lost its indent
+    new_first = _first_meaningful_line(new_string)
+    if new_first and _leading_whitespace(new_first):
+        return new_string  # already has indent, nothing to fix
+
+    lines = new_string.split("\n")
+    out: list[str] = []
+    for line in lines:
+        if line.strip():
+            out.append(old_indent + line.lstrip(" \t"))
         else:
-            # Line is less-indented than the LLM's base — e.g. a dedent at
-            # the start of new_string. Anchor to the file's base.
-            out_lines.append(file_indent + line.lstrip(" \t"))
-    return "\n".join(out_lines)
+            out.append(line)
+    return "\n".join(out)
 
 
 def _maybe_unescape_new_string(new_string: str,
@@ -305,35 +382,60 @@ def _maybe_unescape_new_string(new_string: str,
 
 
 def _apply_replacements(content: str, matches: List[Tuple[int, int]],
-                        new_string: str, old_string: Optional[str] = None) -> str:
-    """
-    Apply replacements at the given positions.
+                        new_string: str) -> str:
+    """Apply replacements at the given positions.
+
+    Direct replacement with no indentation auto-correction.
+    The caller (fuzzy_find_and_replace) handles first-line indent
+    preservation when old_string has leading whitespace.
 
     Args:
         content: Original content
         matches: List of (start, end) positions to replace
         new_string: Replacement text
-        old_string: When non-None, signals that the match came from a
-            non-exact fuzzy strategy; ``new_string`` is re-indented to
-            match the file's actual indentation before substitution.
 
     Returns:
         Content with replacements applied
     """
     # Sort matches by position (descending) to replace from end to start
-    # This preserves positions of earlier matches
     sorted_matches = sorted(matches, key=lambda x: x[0], reverse=True)
 
     result = content
     for start, end in sorted_matches:
-        if old_string is not None:
-            file_region = content[start:end]
-            adjusted = _reindent_replacement(file_region, old_string, new_string)
-        else:
-            adjusted = new_string
-        result = result[:start] + adjusted + result[end:]
+        # Direct replacement covering the full matched region
+        # (including original first-line indentation)
+        result = result[:start] + new_string + result[end:]
 
     return result
+
+
+def _verify_match_content(content: str, matches: List[Tuple[int, int]],
+                           old_string: str) -> bool:
+    """Verify that the matched region of the file actually resembles old_string.
+
+    After a non-exact fuzzy match, the matched location could be completely
+    wrong if old_string contains generic keywords that appear elsewhere in
+    the file.  This function strips ALL whitespace from both the matched
+    region and old_string, then checks their overall SequenceMatcher ratio.
+
+    A ratio >= 0.40 is accepted (whitespace-stripped text can still differ
+    significantly in punctuation, quotes, and structure even when the
+    match is correct, especially after line_trimmed / indentation_flexible).
+    """
+    if not matches:
+        return False
+
+    matched_text = "".join(content[s:e] for s, e in matches)
+    old_flat = re.sub(r"\s+", "", old_string)
+    matched_flat = re.sub(r"\s+", "", matched_text)
+
+    # Quick length sanity check: matched region must be at least 40%
+    # as long as old_string (whitespace stripped).
+    if len(matched_flat) < len(old_flat) * 0.4:
+        return False
+
+    ratio = SequenceMatcher(None, old_flat, matched_flat).ratio()
+    return ratio >= 0.40
 
 
 # =============================================================================

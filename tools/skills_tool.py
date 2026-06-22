@@ -749,10 +749,74 @@ def skills_list(category: str = None, task_id: str = None) -> str:
         )
 
     except Exception as e:
+            return tool_error(str(e), success=False)
+
+
+def find_skills(query: str = "", limit: int = 5, task_id: str = None) -> str:
+    """
+    Search for skills by keyword or topic. Returns only matching skills' names
+    and descriptions. Use this instead of manually scanning a static index.
+
+    Args:
+        query: Keywords or topic to search for (e.g., "debug browser", "windows setup")
+        limit: Maximum results to return (default 5, max 20)
+        task_id: Optional task identifier used to probe the active backend
+
+    Returns:
+        JSON string with matching skill metadata
+    """
+    try:
+        if not query.strip():
+            return json.dumps(
+                {"success": False, "error": "query is required", "skills": []},
+                ensure_ascii=False,
+            )
+
+        all_skills = _find_all_skills()
+        query_lower = query.lower().strip()
+        query_words = [w for w in query_lower.split() if w]
+
+        # Score each skill: exact substring match in name gets priority
+        scored: list[tuple[int, dict]] = []
+        for skill in all_skills:
+            name = (skill.get("name") or "").lower()
+            desc = (skill.get("description") or "").lower()
+            cat = (skill.get("category") or "").lower()
+            search_text = f"{name} {desc} {cat}"
+
+            # Direct substring hit on name = highest priority
+            if query_lower in name:
+                scored.append((100, skill))
+                continue
+
+            # Count how many query words appear in the skill text
+            score = sum(1 for w in query_words if w in search_text)
+            if score > 0:
+                scored.append((score, skill))
+
+        # Sort by score descending, then name
+        scored.sort(key=lambda x: (-x[0], x[1].get("name", "")))
+        results = [s[1] for s in scored[: max(1, min(limit, 20))]]
+
+        categories = sorted(
+            {s.get("category") for s in results if s.get("category")}
+        )
+
+        return json.dumps(
+            {
+                "success": True,
+                "query": query,
+                "skills": results,
+                "categories": categories,
+                "count": len(results),
+                "total_available": len(all_skills),
+                "hint": "Use skill_view(name) to see full skill content",
+            },
+            ensure_ascii=False,
+        )
+
+    except Exception as e:
         return tool_error(str(e), success=False)
-
-
-# ── Plugin skill serving ──────────────────────────────────────────────────
 
 
 def _serve_plugin_skill(
@@ -1591,48 +1655,38 @@ SKILL_VIEW_SCHEMA = {
         },
         "required": ["name"],
     },
+    }
+
+FIND_SKILLS_SCHEMA = {
+    "name": "find_skills",
+    "description": "Search for skills by keyword or topic. Returns matching skill names and descriptions. Use this to discover relevant skills for your current task.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Keywords or topic to search for (e.g., 'debug browser', 'image generation', 'windows setup')",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum results to return (default 5, max 20)",
+                "default": 5,
+            },
+        },
+        "required": ["query"],
+    },
 }
 
 registry.register(
-    name="skills_list",
+    name="find_skills",
     toolset="skills",
-    schema=SKILLS_LIST_SCHEMA,
-    handler=lambda args, **kw: skills_list(
-        category=args.get("category"), task_id=kw.get("task_id")
+    schema=FIND_SKILLS_SCHEMA,
+    handler=lambda args, **kw: find_skills(
+        query=args.get("query", ""),
+        limit=args.get("limit", 5),
+        task_id=kw.get("task_id"),
     ),
     check_fn=check_skills_requirements,
-    emoji="📚",
+    emoji="🔍",
 )
-def _skill_view_with_bump(args, **kw):
-    """Invoke skill_view, then bump view_count on success. Best-effort: a
-    telemetry failure never breaks the tool call."""
-    name = args.get("name", "")
-    result = skill_view(
-        name, file_path=args.get("file_path"), task_id=kw.get("task_id")
-    )
-    try:
-        parsed = json.loads(result)
-        if isinstance(parsed, dict) and parsed.get("success"):
-            # Use the resolved skill name from the payload when present —
-            # qualified forms ("plugin:skill") return with the canonical name.
-            resolved = parsed.get("name") or name
-            if resolved:
-                from tools.skill_usage import bump_use, bump_view
-                bump_view(str(resolved))
-                # A skill_view tool call is the agent actively loading the skill
-                # to act on it — that counts as use, not just a browse/view.
-                # Curator's stale timer keys off last_used_at (see agent/curator.py).
-                bump_use(str(resolved))
-    except Exception:
-        pass
-    return result
 
-
-registry.register(
-    name="skill_view",
-    toolset="skills",
-    schema=SKILL_VIEW_SCHEMA,
-    handler=_skill_view_with_bump,
-    check_fn=check_skills_requirements,
-    emoji="📚",
-)

@@ -330,8 +330,20 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
 
     # First turn of a new session (or recovering from a broken stored
     # prompt) — build from scratch.
-    agent._cached_system_prompt = agent._build_system_prompt(system_message)
 
+    # One-shot skill organisation: if there are unorganised skills (from a
+    # fresh install or upgrade), classify them via LLM and move into
+    # category directories before building the system prompt.  Runs at most
+    # once per HERMES_HOME — a sentinel file prevents re-runs.
+    try:
+        from agent.skill_organizer import needs_organize, organize_skills
+        if needs_organize():
+            logger.info("Unorganised skills detected; running auto-classification.")
+            organize_skills(agent)
+    except Exception as _org_exc:
+        logger.warning("Skill organisation failed (non-blocking): %s", _org_exc)
+
+    agent._cached_system_prompt = agent._build_system_prompt(system_message)
     # Plugin hook: on_session_start — fired once when a brand-new
     # session is created (not on continuation).  Plugins can use this
     # to initialise session-scoped state (e.g. warm a memory cache).
@@ -918,7 +930,7 @@ def run_conversation(
                 # CLI TUI mode: use prompt_toolkit widget instead of raw spinner
                 # (works in both streaming and non-streaming modes)
                 agent.thinking_callback(f"{face} {verb}...")
-            elif not agent._has_stream_consumers() and agent._should_start_quiet_spinner():
+            elif not agent._simple_mode and not agent._has_stream_consumers() and agent._should_start_quiet_spinner():
                 # Raw KawaiiSpinner only when no streaming consumers and the
                 # spinner output has a safe sink.
                 spinner_type = random.choice(['brain', 'sparkle', 'pulse', 'moon', 'star'])
@@ -1855,8 +1867,9 @@ def run_conversation(
 
                     # Log API call details for debugging/observability
                     _cache_pct = ""
-                    if canonical_usage.cache_read_tokens and prompt_tokens:
-                        _cache_pct = f" cache={canonical_usage.cache_read_tokens}/{prompt_tokens} ({100*canonical_usage.cache_read_tokens/prompt_tokens:.0f}%)"
+                    if canonical_usage.cache_read_tokens and canonical_usage.input_tokens is not None:
+                        total_cache = canonical_usage.cache_read_tokens + canonical_usage.input_tokens
+                        _cache_pct = f" cache_hit={canonical_usage.cache_read_tokens}/{total_cache} ({100*canonical_usage.cache_read_tokens/max(1,total_cache):.0f}%)"
                     logger.info(
                         "API call #%d: model=%s provider=%s in=%d out=%d total=%d latency=%.1fs%s",
                         agent.session_api_calls, agent.model, agent.provider or "unknown",
@@ -3515,9 +3528,13 @@ def run_conversation(
                                 _retry_after = min(float(_ra_raw), 120)  # Cap at 2 minutes
                             except (TypeError, ValueError):
                                 pass
-                wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
+                wait_time = _retry_after if _retry_after else (
+                    jittered_backoff(retry_count, base_delay=3.0, max_delay=20.0)
+                    if is_rate_limited
+                    else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
+                )
                 if is_rate_limited:
-                    agent._buffer_status(f"⏱️ Rate limited. Waiting {wait_time:.1f}s (attempt {retry_count + 1}/{max_retries})...")
+                    agent._emit_status(f"⏱️ Rate limited. Waiting {wait_time:.1f}s (attempt {retry_count + 1}/{max_retries})...")
                 else:
                     agent._buffer_status(f"⏳ Retrying in {wait_time:.1f}s (attempt {retry_count}/{max_retries})...")
                 logger.warning(
@@ -3553,6 +3570,7 @@ def run_conversation(
                             f"error retry backoff ({retry_count}/{max_retries}), "
                             f"{int(sleep_end - time.time())}s remaining"
                         )
+                continue
         
         # If the API call was interrupted, skip response processing
         if interrupted:

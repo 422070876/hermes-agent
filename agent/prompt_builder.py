@@ -170,6 +170,14 @@ SESSION_SEARCH_GUIDANCE = (
     "asking them to repeat themselves."
 )
 
+PROJECT_CONTEXT_GUIDANCE = (
+    "Project context files (AGENTS.md, CLAUDE.md, .cursorrules, .hermes.md) "
+    "from your working directory are NOT loaded automatically. If you need "
+    "project-specific instructions, use search_files() to find them, then "
+    "read_file() to load them when relevant — for example, read AGENTS.md at "
+    "the start of a coding task in a repo that has one."
+)
+
 SKILLS_GUIDANCE = (
     "After completing a complex task (5+ tool calls), fixing a tricky error, "
     "or discovering a non-trivial workflow, save the approach as a "

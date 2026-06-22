@@ -263,6 +263,82 @@ def _validate_name(name: str) -> Optional[str]:
     return None
 
 
+def _auto_classify_skill(name: str, content: str) -> Optional[str]:
+    """Auto-classify a skill into an existing category based on keyword matching.
+
+    Matches the skill's name and frontmatter description against:
+      1. ``keywords:`` list in DESCRIPTION.md (strongest signal)
+      2. ``description:`` text in DESCRIPTION.md (fallback)
+      3. Category directory name (weakest signal)
+
+    Returns the best-matching category path (e.g. ``"mlops/inference"``) or None.
+    """
+    try:
+        import re
+        from pathlib import Path
+        from hermes_constants import get_skills_dir
+        from agent.skill_utils import parse_frontmatter
+
+        skills_dir = get_skills_dir()
+        if not skills_dir.exists():
+            return None
+
+        # Parse the new skill's frontmatter
+        # Ensure trailing newline so parse_frontmatter's regex can find closing ---
+        raw_content = (content or "").strip() + "\n"
+        fm, _ = parse_frontmatter(raw_content)
+        skill_desc = (fm.get("description") or "").lower()
+        skill_name = name.lower()
+        search_text = f"{skill_name} {skill_desc}"
+
+        best_category = None
+        best_score = 0
+
+        for desc_file in skills_dir.rglob("DESCRIPTION.md"):
+            if desc_file.parent == skills_dir:
+                continue
+            try:
+                desc_content = desc_file.read_text(encoding="utf-8")
+                desc_fm, _ = parse_frontmatter(desc_content)
+                rel = desc_file.parent.relative_to(skills_dir)
+                cat_path = str(rel.as_posix())
+
+                score = 0
+
+                # 1. Match against keywords (strongest)
+                keywords = desc_fm.get("keywords", []) or []
+                if isinstance(keywords, str):
+                    keywords = [keywords]
+                if isinstance(keywords, list):
+                    for kw in keywords:
+                        kw_lower = str(kw).strip().lower()
+                        if len(kw_lower) >= 3 and kw_lower in search_text:
+                            score += 3 if f" {kw_lower} " in f" {search_text} " else 1
+
+                # 2. Match against description text (fallback)
+                cat_desc = str(desc_fm.get("description", "") or "").lower()
+                for word in re.findall(r"[a-z]+", cat_desc):
+                    if len(word) >= 4 and word in search_text:
+                        score += 1
+
+                # 3. Match category directory name itself
+                cat_name_lower = cat_path.replace("/", " ").replace("-", " ").lower()
+                for word in cat_name_lower.split():
+                    if len(word) >= 3 and word in search_text:
+                        score += 2
+
+                if score > best_score:
+                    best_score = score
+                    best_category = cat_path
+
+            except Exception:
+                continue
+
+        return best_category if best_score >= 2 else None
+    except Exception:
+        return None
+
+
 def _validate_category(category: Optional[str]) -> Optional[str]:
     """Validate an optional category name used as a single directory segment."""
     if category is None:
@@ -1032,6 +1108,10 @@ def skill_manage(
     if action == "create":
         if not content:
             return tool_error("content is required for 'create'. Provide the full SKILL.md text (frontmatter + body).", success=False)
+        # Auto-classify: if no category given, match against existing
+        # category keywords from DESCRIPTION.md files
+        if not category:
+            category = _auto_classify_skill(name, content)
         result = _create_skill(name, content, category)
 
     elif action == "edit":

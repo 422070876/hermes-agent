@@ -1323,13 +1323,21 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
 
 
 def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
-               new_string: str = None, replace_all: bool = False, patch: str = None,
+               new_string: str = None, replace_all: bool = False,
+               fix_indent_from_old: bool = False, patch: str = None,
                task_id: str = "default", cross_profile: bool = False) -> str:
     """Patch a file using replace mode or V4A patch format.
 
     ``cross_profile`` opts out of the soft cross-Hermes-profile guard for
     targets under another profile's skills/plugins/cron/memories
     directory. Same shape as ``write_file``'s flag.
+
+    ``fix_indent_from_old``: When True and new_string has no first-line indent
+    (e.g. you copied code from a reject diff / .rej file where diff format
+    stripped leading whitespace), restore it from old_string's first-line indent.
+    Pass fix_indent_from_old=True when you know the indentation was lost in
+    transit — the tool will detect the original indent from old_string and
+    apply it to every line of new_string automatically.
     """
     # Check sensitive paths for both replace (explicit path) and V4A patch (extract paths)
     _paths_to_check = []
@@ -1419,7 +1427,7 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 # path would let the two layers disagree about which file is
                 # being edited.
                 _replace_target = _path_to_resolved.get(path) or path
-                result = file_ops.patch_replace(_replace_target, old_string, new_string, replace_all)
+                result = file_ops.patch_replace(_replace_target, old_string, new_string, replace_all, fix_indent_from_old=fix_indent_from_old)
             elif mode == "patch":
                 if not patch:
                     return tool_error("patch content required")
@@ -1590,6 +1598,48 @@ READ_FILE_SCHEMA = {
     }
 }
 
+READ_FILE_RAW_SCHEMA = {
+    "name": "read_file_raw",
+    "description": "Read an entire file as raw text (no line numbers, no pagination). "
+                   "Use this when you need to pass file content directly to write_file "
+                   "without line-number pollution. For large files, use read_file with offset/limit.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Path to the file to read (absolute, relative, or ~/path)"},
+        },
+        "required": ["path"]
+    }
+}
+
+READ_FILE_RAW_SCHEMA = {
+    "name": "read_file_raw",
+    "description": "Read an entire file as raw text (no line numbers, no pagination). "
+                   "Use this when you need to pass file content directly to write_file "
+                   "without line-number pollution. For large files, use read_file with offset/limit.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Path to the file to read (absolute, relative, or ~/path)"},
+        },
+        "required": ["path"]
+    }
+}
+
+READ_FILE_RAW_SCHEMA = {
+    "name": "read_file_raw",
+    "description": "Read an entire file as raw text (no line numbers, no pagination). "
+                   "Use this when you need to pass file content directly to write_file "
+                   "without line-number pollution. For large files, use read_file with offset/limit.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Path to the file to read (absolute, relative, or ~/path)"},
+        },
+        "required": ["path"]
+    }
+}
+
 WRITE_FILE_SCHEMA = {
     "name": "write_file",
     "description": "Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. OVERWRITES the entire file — use 'patch' for targeted edits. Auto-runs syntax checks on .py/.json/.yaml/.toml and other linted languages; only NEW errors introduced by this write are surfaced (pre-existing errors are filtered out).",
@@ -1612,10 +1662,15 @@ PATCH_SCHEMA = {
     "name": "patch",
     "description": (
         "Targeted find-and-replace edits in files. Use this instead of sed/awk in terminal. "
-        "Uses fuzzy matching (9 strategies) so minor whitespace/indentation differences won't break it. "
+        "Uses fuzzy matching (9 strategies) but indentation (spaces/tabs) must match exactly. "
         "Returns a unified diff. Auto-runs syntax checks after editing.\n\n"
         "REPLACE MODE (mode='replace', default): find a unique string and replace it. "
         "REQUIRED PARAMETERS: mode, path, old_string, new_string.\n"
+        "Indentation: new_string\'s indentation is preserved as-is — whatever indent you write on new_string\'s first line is what lands in the file. "
+        "For best results, include several surrounding context lines in old_string to ensure a unique match.\n"
+        "When you copy new_string from a reject diff (.rej) the leading whitespace is often "
+        "stripped by the diff format — set fix_indent_from_old=True to restore indentation "
+        "from old_string automatically.\n"
         "PATCH MODE (mode='patch'): apply V4A multi-file patches for bulk changes. "
         "REQUIRED PARAMETERS: mode, patch."
     ),
@@ -1634,11 +1689,11 @@ PATCH_SCHEMA = {
             },
             "old_string": {
                 "type": "string",
-                "description": "REQUIRED when mode='replace'. Exact text to find and replace. Must be unique in the file unless replace_all=true. Include surrounding context lines to ensure uniqueness.",
+                "description": "REQUIRED when mode='replace'. Exact text to find and replace. Must be unique in the file unless replace_all=true. Include surrounding context lines to ensure uniqueness. ",
             },
             "new_string": {
                 "type": "string",
-                "description": "REQUIRED when mode='replace'. Replacement text. Pass empty string '' to delete the matched text.",
+                "description": "REQUIRED when mode='replace'. Replacement text. Pass empty string '' to delete the matched text. the indentation you write is what lands in the file.",
             },
             "replace_all": {
                 "type": "boolean",
@@ -1652,6 +1707,11 @@ PATCH_SCHEMA = {
             "cross_profile": {
                 "type": "boolean",
                 "description": "Opt out of the cross-profile soft guard. Defaults to false. Set true ONLY after explicit user direction to edit another Hermes profile's skills/plugins/cron/memories.",
+                "default": False,
+            },
+            "fix_indent_from_old": {
+                "type": "boolean",
+                "description": "When True and new_string has no first-line indent (e.g. from a reject diff), restore it from old_string's first-line indent automatically.",
                 "default": False,
             },
         },
@@ -1682,6 +1742,16 @@ SEARCH_FILES_SCHEMA = {
 def _handle_read_file(args, **kw):
     tid = kw.get("task_id") or "default"
     return read_file_tool(path=args.get("path", ""), offset=args.get("offset", 1), limit=args.get("limit", 500), task_id=tid)
+
+
+def _handle_read_file_raw(args, **kw):
+    tid = kw.get("task_id") or "default"
+    path = args.get("path", "")
+    if not path:
+        return json.dumps({"error": "read_file_raw: missing required field 'path'"})
+    file_ops = _get_file_ops(tid)
+    result = file_ops.read_file_raw(path)
+    return json.dumps(result.to_dict(), ensure_ascii=False)
 
 
 def _handle_write_file(args, **kw):
@@ -1715,7 +1785,9 @@ def _handle_patch(args, **kw):
     return patch_tool(
         mode=args.get("mode", "replace"), path=args.get("path"),
         old_string=args.get("old_string"), new_string=args.get("new_string"),
-        replace_all=args.get("replace_all", False), patch=args.get("patch"), task_id=tid,
+        replace_all=args.get("replace_all", False),
+        fix_indent_from_old=bool(args.get("fix_indent_from_old", False)),
+        patch=args.get("patch"), task_id=tid,
         cross_profile=bool(args.get("cross_profile", False)),
     )
 
@@ -1732,6 +1804,7 @@ def _handle_search_files(args, **kw):
 
 
 registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, handler=_handle_read_file, check_fn=_check_file_reqs, emoji="📖", max_result_size_chars=100_000)
+registry.register(name="read_file_raw", toolset="file", schema=READ_FILE_RAW_SCHEMA, handler=_handle_read_file_raw, check_fn=_check_file_reqs, emoji="📄", max_result_size_chars=100_000)
 registry.register(name="write_file", toolset="file", schema=WRITE_FILE_SCHEMA, handler=_handle_write_file, check_fn=_check_file_reqs, emoji="✍️", max_result_size_chars=100_000)
 registry.register(name="patch", toolset="file", schema=PATCH_SCHEMA, handler=_handle_patch, check_fn=_check_file_reqs, emoji="🔧", max_result_size_chars=100_000)
 registry.register(name="search_files", toolset="file", schema=SEARCH_FILES_SCHEMA, handler=_handle_search_files, check_fn=_check_file_reqs, emoji="🔎", max_result_size_chars=100_000)

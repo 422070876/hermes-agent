@@ -3377,21 +3377,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         checkpoints: bool = False,
         pass_session_id: bool = False,
         ignore_rules: bool = False,
-    ):
+        simple_mode: bool = False,
+        ):
         """
         Initialize the Hermes CLI.
 
         Args:
-            model: Model to use (default: from env or claude-sonnet)
-            toolsets: List of toolsets to enable (default: all)
-            provider: Inference provider ("auto", "openrouter", "nous", "openai-codex", "zai", "kimi-coding", "minimax", "minimax-cn")
-            api_key: API key (default: from environment)
-            base_url: API base URL (default: OpenRouter)
-            max_turns: Maximum tool-calling iterations shared with subagents (default: 90)
-            verbose: Enable verbose logging
-            compact: Use compact display mode
-            resume: Session ID to resume (restores conversation history from SQLite)
-            pass_session_id: Include the session ID in the agent's system prompt
+        model: Model to use (default: from env or claude-sonnet)
+        toolsets: List of toolsets to enable (default: all)
+        provider: Inference provider ("auto", "openrouter", "nous", "openai-codex", "zai", "kimi-coding", "minimax", "minimax-cn")
+        api_key: API key (default: from environment)
+        base_url: API base URL (default: OpenRouter)
+        max_turns: Maximum tool-calling iterations shared with subagents (default: 90)
+        verbose: Enable verbose logging
+        compact: Use compact display mode
+        resume: Session ID to resume (restores conversation history from SQLite)
+        pass_session_id: Include the session ID in the agent's system prompt
         """
         # Initialize Rich console
         self.console = Console()
@@ -3583,6 +3584,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         # pass skip_context_files=True and skip_memory=True to AIAgent so
         # AGENTS.md/SOUL.md/.cursorrules and persistent memory are not loaded.
         self.ignore_rules = ignore_rules or os.environ.get("HERMES_IGNORE_RULES") == "1"
+        self.simple_mode = simple_mode or CLI_CONFIG["agent"].get("simple_mode", False)
         
         # Ephemeral system prompt: env var takes precedence, then config
         self.system_prompt = (
@@ -4219,6 +4221,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             "session_completion_tokens": 0,
             "session_total_tokens": 0,
             "session_api_calls": 0,
+            "session_cost_usd": 0.0,
+            "session_cache_ratio": None,
             "compressions": 0,
             "active_background_tasks": 0,
             "active_background_processes": 0,
@@ -4255,6 +4259,42 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         snapshot["session_total_tokens"] = getattr(agent, "session_total_tokens", 0) or 0
         snapshot["session_api_calls"] = getattr(agent, "session_api_calls", 0) or 0
 
+        # Calculate cache ratio and cost
+        # Uses DeepSeek Reasonix formula: cacheHit / (cacheHit + cacheMiss)
+        # cr = cache_read_tokens  ↔  cacheHit (from prompt_cache_hit_tokens for DeepSeek)
+        # ci = input_tokens       ↔  cacheMiss (from prompt_cache_miss_tokens for DeepSeek)
+        cr = snapshot["session_cache_read_tokens"]
+        ci = snapshot["session_input_tokens"]
+        if cr and ci is not None:
+            snapshot["session_cache_ratio"] = min(100.0, round(cr / max(1, cr + ci) * 100, 1))
+        else:
+            snapshot["session_cache_ratio"] = None
+
+        if snapshot["session_api_calls"]:
+            try:
+                from agent.usage_pricing import estimate_usage_cost, CanonicalUsage
+                cost_result = estimate_usage_cost(
+                    getattr(agent, "model", ""),
+                    CanonicalUsage(
+                        input_tokens=snapshot["session_input_tokens"],
+                        output_tokens=snapshot["session_output_tokens"],
+                        cache_read_tokens=snapshot["session_cache_read_tokens"],
+                        cache_write_tokens=snapshot["session_cache_write_tokens"],
+                    ),
+                    provider=getattr(agent, "provider", None),
+                    base_url=getattr(agent, "base_url", None),
+                )
+                snapshot["session_cost_usd"] = float(cost_result.amount_usd) if cost_result.amount_usd is not None else 0.0
+                snapshot["session_cache_billable"] = cost_result.cache_billable
+                snapshot["session_currency"] = cost_result.currency
+            except Exception:
+                snapshot["session_cost_usd"] = 0.0
+                snapshot["session_cache_billable"] = False
+                snapshot["session_currency"] = "USD"
+        else:
+            snapshot["session_cost_usd"] = 0.0
+            snapshot["session_cache_billable"] = False
+            snapshot["session_currency"] = "USD"
         compressor = getattr(agent, "context_compressor", None)
         if compressor:
             # last_prompt_tokens is parked at the -1 sentinel right after a
@@ -4473,7 +4513,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             if width is None:
                 width = self._get_tui_terminal_width()
             percent = snapshot["context_percent"]
-            percent_label = f"{percent}%" if percent is not None else "--"
             duration_label = snapshot["duration"]
 
             yolo_active = self._is_session_yolo_active()
@@ -4483,7 +4522,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     text += " · ⚠ YOLO"
                 return self._trim_status_bar_text(text, width)
             if width < 76:
-                parts = [f"⚕ {snapshot['model_short']}", percent_label]
+                parts = [f"⚕ {snapshot['model_short']}"]
                 compressions = snapshot.get("compressions", 0)
                 if compressions:
                     parts.append(f"🗜️ {compressions}")
@@ -4493,6 +4532,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 bg_proc_count = snapshot.get("active_background_processes", 0)
                 if bg_proc_count:
                     parts.append(f"⚙ {bg_proc_count}")
+                # Cache hit ratio
+                cache_ratio = snapshot.get("session_cache_ratio")
+                cache_billable = snapshot.get("session_cache_billable", False)
+                if cache_ratio is not None and cache_billable:
+                    parts.append(f"缓存 {cache_ratio}%")
+                # Session cost
+                cost = snapshot.get("session_cost_usd", 0)
+                if cost:
+                    currency_symbol = snapshot.get("session_currency", "USD")
+                    parts.append(("¥" if currency_symbol == "CNY" else "$") + f"{cost:.4f}")
                 parts.append(duration_label)
                 if yolo_active:
                     parts.append("⚠ YOLO")
@@ -4506,7 +4555,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 context_label = "ctx --"
 
             compressions = snapshot.get("compressions", 0)
-            parts = [f"⚕ {snapshot['model_short']}", context_label, percent_label]
+            parts = [f"⚕ {snapshot['model_short']}", context_label]
             if compressions:
                 parts.append(f"🗜️ {compressions}")
             bg_count = snapshot.get("active_background_tasks", 0)
@@ -4515,6 +4564,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             bg_proc_count = snapshot.get("active_background_processes", 0)
             if bg_proc_count:
                 parts.append(f"⚙ {bg_proc_count}")
+            # Cache hit ratio
+            cache_ratio = snapshot.get("session_cache_ratio")
+            cache_billable = snapshot.get("session_cache_billable", False)
+            if cache_ratio is not None and cache_billable:
+                parts.append(f"缓存 {cache_ratio}%")
+            # Session cost
+            cost = snapshot.get("session_cost_usd", 0)
+            if cost:
+                currency_symbol = snapshot.get("session_currency", "USD")
+                parts.append(("¥" if currency_symbol == "CNY" else "$") + f"{cost:.4f}")
             parts.append(duration_label)
             prompt_elapsed = snapshot.get("prompt_elapsed")
             if prompt_elapsed:
@@ -4555,7 +4614,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 frags.append(("class:status-bar", " "))
             else:
                 percent = snapshot["context_percent"]
-                percent_label = f"{percent}%" if percent is not None else "--"
                 if width < 76:
                     compressions = snapshot.get("compressions", 0)
                     bg_count = snapshot.get("active_background_tasks", 0)
@@ -4564,7 +4622,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         ("class:status-bar", " ⚕ "),
                         ("class:status-bar-strong", snapshot["model_short"]),
                         ("class:status-bar-dim", " · "),
-                        (self._status_bar_context_style(percent), percent_label),
+                        (self._status_bar_context_style(percent)),
                     ]
                     if compressions:
                         frags.append(("class:status-bar-dim", " · "))
@@ -4575,6 +4633,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     if bg_proc_count:
                         frags.append(("class:status-bar-dim", " · "))
                         frags.append(("class:status-bar-strong", f"⚙ {bg_proc_count}"))
+                    # Cache hit ratio
+                    cache_ratio = snapshot.get("session_cache_ratio")
+                    cache_billable = snapshot.get("session_cache_billable", False)
+                    if cache_ratio is not None and cache_billable:
+                        frags.append(("class:status-bar-dim", " · "))
+                        frags.append(("class:status-bar-cache", f"缓存 {cache_ratio}%"))
+                    # Session cost
+                    cost = snapshot.get("session_cost_usd", 0)
+                    if cost:
+                        frags.append(("class:status-bar-dim", " · "))
+                        currency_symbol = snapshot.get("session_currency", "USD")
+                        frags.append(("class:status-bar-cost", ("¥" if currency_symbol == "CNY" else "$") + f"{cost:.4f}"))
                     frags.extend([
                         ("class:status-bar-dim", " · "),
                         ("class:status-bar-dim", duration_label),
@@ -4585,7 +4655,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     frags.append(("class:status-bar", " "))
                 else:
                     if snapshot["context_length"]:
-                        ctx_total = _format_context_length(snapshot["context_length"])
                         ctx_used = format_token_count_compact(snapshot["context_tokens"])
                         context_label = f"{ctx_used}/{ctx_total}"
                     else:
@@ -4603,7 +4672,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         ("class:status-bar-dim", " │ "),
                         (bar_style, self._build_context_bar(percent)),
                         ("class:status-bar-dim", " "),
-                        (bar_style, percent_label),
+                        (bar_style),
                     ]
                     if compressions:
                         frags.append(("class:status-bar-dim", " │ "))
@@ -4614,6 +4683,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     if bg_proc_count:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append(("class:status-bar-strong", f"⚙ {bg_proc_count}"))
+                    # Cache hit ratio & cost
+                    cache_ratio = snapshot.get("session_cache_ratio")
+                    cache_billable = snapshot.get("session_cache_billable", False)
+                    if cache_ratio is not None and cache_billable:
+                        frags.append(("class:status-bar-dim", " │ "))
+                        frags.append(("class:status-bar-cache", f"缓存 {cache_ratio}%"))
+                    cost = snapshot.get("session_cost_usd", 0)
+                    if cost:
+                        frags.append(("class:status-bar-dim", " │ "))
+                        currency_symbol = snapshot.get("session_currency", "USD")
+                        frags.append(("class:status-bar-cost", ("¥" if currency_symbol == "CNY" else "$") + f"{cost:.4f}"))
                     frags.extend([
                         ("class:status-bar-dim", " │ "),
                         ("class:status-bar-dim", duration_label),
@@ -8840,7 +8920,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         print(f"  Cost source:              {cost_result.source:>10}")
         if cost_result.amount_usd is not None:
             prefix = "~" if cost_result.status == "estimated" else ""
-            print(f"  Total cost:              {prefix}${float(cost_result.amount_usd):>10.4f}")
+            print(f"  Total cost:              {prefix}¥{float(cost_result.amount_usd):>10.4f}")
         elif cost_result.status == "included":
             print(f"  Total cost:              {'included':>10}")
         else:
@@ -14707,6 +14787,7 @@ def main(
     pass_session_id: bool = False,
     ignore_user_config: bool = False,
     ignore_rules: bool = False,
+    simple_mode: bool = False,
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant
@@ -14830,18 +14911,19 @@ def main(
 
     # Create CLI instance
     cli = HermesCLI(
-        model=model,
-        toolsets=toolsets_list,
-        provider=provider,
-        api_key=api_key,
-        base_url=base_url,
-        max_turns=max_turns,
-        verbose=verbose,
-        compact=compact,
-        resume=resume,
-        checkpoints=checkpoints,
-        pass_session_id=pass_session_id,
-        ignore_rules=ignore_rules,
+    model=model,
+    toolsets=toolsets_list,
+    provider=provider,
+    api_key=api_key,
+    base_url=base_url,
+    max_turns=max_turns,
+    verbose=verbose,
+    compact=compact,
+    resume=resume,
+    checkpoints=checkpoints,
+    pass_session_id=pass_session_id,
+    ignore_rules=ignore_rules,
+    simple_mode=simple_mode,
     )
 
     if parsed_skills:

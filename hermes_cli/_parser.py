@@ -228,19 +228,26 @@ def build_top_level_parser():
         help="Launch the modern TUI instead of the classic REPL",
     )
     _inherited_flag(
-        parser,
-        "--cli",
-        action="store_true",
-        default=False,
-        help="Force the classic prompt_toolkit REPL (overrides display.interface=tui)",
+    parser,
+    "--cli",
+    action="store_true",
+    default=False,
+    help="Force the classic prompt_toolkit REPL (overrides display.interface=tui)",
     )
     _inherited_flag(
-        parser,
-        "--dev",
-        dest="tui_dev",
-        action="store_true",
-        default=False,
-        help="With --tui: run TypeScript sources via tsx (skip dist build)",
+    parser,
+    "--simple-mode",
+    action="store_true",
+    default=False,
+    help="Single-threaded mode: disable parallel tool execution, sub-agent delegation, spinner thread, and API-call threading",
+    )
+    _inherited_flag(
+    parser,
+    "--dev",
+    dest="tui_dev",
+    action="store_true",
+    default=False,
+    help="With --tui: run TypeScript sources via tsx (skip dist build)",
     )
 
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
@@ -393,17 +400,24 @@ def build_top_level_parser():
         help="Launch the modern TUI instead of the classic REPL",
     )
     _inherited_flag(
-        chat_parser,
-        "--cli",
-        action="store_true",
-        default=False,
-        help="Force the classic prompt_toolkit REPL (overrides display.interface=tui)",
+    chat_parser,
+    "--cli",
+    action="store_true",
+    default=False,
+    help="Force the classic prompt_toolkit REPL (overrides display.interface=tui)",
     )
     _inherited_flag(
-        chat_parser,
-        "--dev",
-        dest="tui_dev",
-        action="store_true",
+    chat_parser,
+    "--simple-mode",
+    action="store_true",
+    default=argparse.SUPPRESS,
+    help="Single-threaded mode: disable parallel tool execution, sub-agent delegation, spinner thread, and API-call threading",
+    )
+    _inherited_flag(
+    chat_parser,
+    "--dev",
+    dest="tui_dev",
+    action="store_true",
         default=False,
         help="With --tui: run TypeScript sources via tsx (skip dist build)",
     )

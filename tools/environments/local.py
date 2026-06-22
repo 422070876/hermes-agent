@@ -115,6 +115,7 @@ def _build_provider_env_blocklist() -> frozenset:
 
     try:
         from hermes_cli.config import OPTIONAL_ENV_VARS
+
         for name, metadata in OPTIONAL_ENV_VARS.items():
             category = metadata.get("category")
             if category in {"tool", "messaging"}:
@@ -221,7 +222,7 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
 
     for key, value in (extra_env or {}).items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
-            real_key = key[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
+            real_key = key[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX) :]
             sanitized[real_key] = value
         elif key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
             sanitized[key] = value
@@ -235,7 +236,10 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
 
 
 def _find_bash() -> str:
-    """Find bash for command execution."""
+    """Find bash for command execution.
+
+    On Windows, prefers Git Bash but falls back to WSL bash if available.
+    """
     if not _IS_WINDOWS:
         return (
             shutil.which("bash")
@@ -244,6 +248,11 @@ def _find_bash() -> str:
             or os.environ.get("SHELL")
             or "/bin/sh"
         )
+
+    # Windows bash detection order:
+    # 1. Explicit HERMES_GIT_BASH_PATH env var
+    # 2. Git Bash (preferred - full POSIX compatibility)
+    # 3. WSL bash (fallback - works for most commands)
 
     custom = os.environ.get("HERMES_GIT_BASH_PATH")
     if custom and os.path.isfile(custom):
@@ -259,30 +268,56 @@ def _find_bash() -> str:
     #   PortableGit: %LOCALAPPDATA%\hermes\git\bin\bash.exe   (primary)
     #   MinGit:      %LOCALAPPDATA%\hermes\git\usr\bin\bash.exe (legacy/32-bit fallback)
     _local_appdata = os.environ.get("LOCALAPPDATA", "")
-    _hermes_portable_git = os.path.join(_local_appdata, "hermes", "git") if _local_appdata else ""
+    _hermes_portable_git = (
+        os.path.join(_local_appdata, "hermes", "git") if _local_appdata else ""
+    )
     if _hermes_portable_git:
         for candidate in (
-            os.path.join(_hermes_portable_git, "bin", "bash.exe"),        # PortableGit (primary)
-            os.path.join(_hermes_portable_git, "usr", "bin", "bash.exe"), # MinGit fallback
+            os.path.join(
+                _hermes_portable_git, "bin", "bash.exe"
+            ),  # PortableGit (primary)
+            os.path.join(
+                _hermes_portable_git, "usr", "bin", "bash.exe"
+            ),  # MinGit fallback
         ):
             if os.path.isfile(candidate):
                 return candidate
+
+    # Git Bash standard installation paths
+    for candidate in (
+        os.path.join(
+            os.environ.get("ProgramFiles", r"C:\Program Files"),
+            "Git",
+            "bin",
+            "bash.exe",
+        ),
+        os.path.join(
+            os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+            "Git",
+            "bin",
+            "bash.exe",
+        ),
+        os.path.join(_local_appdata, "Programs", "Git", "bin", "bash.exe"),
+        r"C:\app\Git\bin\bash.exe",
+    ):
+        if candidate and os.path.isfile(candidate):
+            return candidate
 
     found = shutil.which("bash")
     if found:
         return found
 
-    for candidate in (
-        os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Git", "bin", "bash.exe"),
-        os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Git", "bin", "bash.exe"),
-        os.path.join(_local_appdata, "Programs", "Git", "bin", "bash.exe"),
-    ):
-        if candidate and os.path.isfile(candidate):
-            return candidate
+    # WSL bash fallback
+    wsl_bash = os.path.join(
+        os.environ.get("SystemRoot", r"C:\Windows"), "System32", "bash.exe"
+    )
+    if os.path.isfile(wsl_bash):
+        return wsl_bash
 
     raise RuntimeError(
-        "Git Bash not found. Hermes Agent requires Git for Windows on Windows.\n"
-        "Install it from: https://git-scm.com/download/win\n"
+        "Bash not found on Windows. Hermes Agent requires either:\n"
+        "  1. Git for Windows: https://git-scm.com/download/win\n"
+        "  2. WSL (Windows Subsystem for Linux)\n"
         "Or set HERMES_GIT_BASH_PATH to your bash.exe location."
     )
 
@@ -454,7 +489,7 @@ def _make_run_env(env: dict) -> dict:
     run_env = {}
     for k, v in merged.items():
         if k.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
-            real_key = k[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
+            real_key = k[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX) :]
             run_env[real_key] = v
         elif k not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(k):
             run_env[k] = v
@@ -518,23 +553,16 @@ def _resolve_shell_init_files() -> list[str]:
     candidates: list[str] = []
     if explicit:
         candidates.extend(explicit)
-    elif auto_bashrc and not _IS_WINDOWS:
-        # Build a login-shell-ish source list so tools like n / nvm / asdf /
-        # pyenv that self-install into the user's shell rc land on PATH in
-        # the captured snapshot.
-        #
-        # ~/.profile and ~/.bash_profile run first because they have no
-        # interactivity guard — installers like ``n`` and ``nvm`` append
-        # their PATH export there on most distros, and a non-interactive
-        # ``. ~/.profile`` picks that up.
-        #
-        # ~/.bashrc runs last. On Debian/Ubuntu the default bashrc starts
-        # with ``case $- in *i*) ;; *) return;; esac`` and exits early
-        # when sourced non-interactively, which is why sourcing bashrc
-        # alone misses nvm/n PATH additions placed below that guard. We
-        # still include it so users who put PATH logic in bashrc (and
-        # stripped the guard, or never had one) keep working.
-        candidates.extend(["~/.profile", "~/.bash_profile", "~/.bashrc"])
+    elif auto_bashrc:
+        if _IS_WINDOWS:
+            # Windows (WSL/Git Bash): check for bashrc in home directory
+            # WSL maps Windows HOME to /home/<user>, Git Bash to /c/Users/<user>
+            candidates.extend(["~/.bashrc", "~/.bash_profile"])
+        else:
+            # Linux/macOS: full login shell initialization
+            # ~/.profile and ~/.bash_profile run first (no interactivity guard)
+            # ~/.bashrc runs last (may have interactivity guard)
+            candidates.extend(["~/.profile", "~/.bash_profile", "~/.bashrc"])
 
     resolved: list[str] = []
     for raw in candidates:
@@ -585,21 +613,19 @@ class LocalEnvironment(BaseEnvironment):
     def get_temp_dir(self) -> str:
         """Return a shell-safe writable temp dir for local execution.
 
-        Termux does not provide /tmp by default, but exposes a POSIX TMPDIR.
-        Prefer POSIX-style env vars when available, keep using /tmp on regular
-        Unix systems, and only fall back to tempfile.gettempdir() when it also
-        resolves to a POSIX path.
+                On non-Windows: prefers POSIX env vars (TMPDIR/TMP/TEMP that start
+                with /), falls back to /tmp, then tempfile.gettempdir().
 
         Check the environment configured for this backend first so callers can
-        override the temp root explicitly (for example via terminal.env or a
-        custom TMPDIR), then fall back to the host process environment.
+                override the temp root explicitly (for example via terminal.env or a
+                custom TMPDIR), then fall back to the host process environment.
 
-        **Windows:** hardcoded ``/tmp`` is wrong in two ways — native Python
-        can't open the path, and the Windows default temp (``%TEMP%``) often
-        contains spaces (``C:\\Users\\Some Name\\AppData\\Local\\Temp``) that
-        break unquoted bash interpolations.  Use a dedicated cache dir under
-        ``HERMES_HOME`` instead — single-word path, guaranteed to exist, same
-        string resolves in both Git Bash and native Python.
+                **Windows:** hardcoded ``/tmp`` is wrong in two ways — native Python
+                can't open the path, and the Windows default temp (``%TEMP%``) often
+                contains spaces (``C:\\Users\\Some Name\\AppData\\Local\\Temp``) that
+                break unquoted bash interpolations.  Use a dedicated cache dir under
+                ``HERMES_HOME`` instead — single-word path, guaranteed to exist, same
+                string resolves in both Git Bash and native Python.
         """
         if _IS_WINDOWS:
             # Derive a Windows-safe temp dir under HERMES_HOME.  Using
@@ -609,6 +635,7 @@ class LocalEnvironment(BaseEnvironment):
             # the path so we can guarantee no spaces.
             try:
                 from hermes_constants import get_hermes_home
+
                 cache_dir = get_hermes_home() / "cache" / "terminal"
             except Exception:
                 cache_dir = Path(tempfile.gettempdir()) / "hermes_terminal"
@@ -630,9 +657,14 @@ class LocalEnvironment(BaseEnvironment):
 
         return "/tmp"
 
-    def _run_bash(self, cmd_string: str, *, login: bool = False,
-                  timeout: int = 120,
-                  stdin_data: str | None = None) -> subprocess.Popen:
+    def _run_bash(
+        self,
+        cmd_string: str,
+        *,
+        login: bool = False,
+        timeout: int = 120,
+        stdin_data: str | None = None,
+    ) -> subprocess.Popen:
         bash = _find_bash()
         # For login-shell invocations (used by init_session to build the
         # environment snapshot), prepend sources for the user's bashrc /
@@ -706,19 +738,16 @@ class LocalEnvironment(BaseEnvironment):
         def _group_alive(pgid: int) -> bool:
             try:
                 # POSIX-only: _IS_WINDOWS is handled before this helper is used.
-                os.killpg(pgid, 0)  # windows-footgun: ok — POSIX process-group alive probe
+                os.killpg(pgid, 0)
                 return True
             except ProcessLookupError:
                 return False
             except PermissionError:
-                # The group exists, even if this process cannot signal it.
                 return True
 
         def _wait_for_group_exit(pgid: int, timeout: float) -> bool:
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
-                # Reap the wrapper promptly. A dead but unreaped group leader
-                # still makes killpg(pgid, 0) report the group as alive.
                 try:
                     proc.poll()
                 except Exception:
@@ -734,7 +763,32 @@ class LocalEnvironment(BaseEnvironment):
 
         try:
             if _IS_WINDOWS:
-                proc.terminate()
+                # taskkill /T kills the process tree, /F forces termination.
+                subprocess.run(
+                    ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                    capture_output=True,
+                    timeout=5,
+                )
+                # Chrome processes spawned by agent-browser survive taskkill /T
+                # because Python's proc.kill() (in the child script's own timeout
+                # handler) only kills the direct child, not grandchild Chrome.
+                # Those orphaned Chrome processes later exit and broadcast
+                # Ctrl+C to the console group, causing KeyboardInterrupt.
+                # Kill any Chrome launched by agent-browser by matching its
+                # command line against the agent-browser data directory.
+                try:
+                    pwsh = (
+                        "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
+                        "Where-Object { $_.CommandLine -match 'agent-browser' } | "
+                        "Stop-Process -Force -ErrorAction SilentlyContinue"
+                    )
+                    subprocess.run(
+                        ["powershell", "-NoProfile", "-Command", pwsh],
+                        capture_output=True,
+                        timeout=5,
+                    )
+                except Exception:
+                    pass
             else:
                 try:
                     pgid = os.getpgid(proc.pid)
@@ -744,7 +798,9 @@ class LocalEnvironment(BaseEnvironment):
                         raise
 
                 try:
-                    os.killpg(pgid, signal.SIGTERM)  # windows-footgun: ok — POSIX process-group SIGTERM (guarded by _IS_WINDOWS above)
+                    os.killpg(
+                        pgid, signal.SIGTERM
+                    )  # windows-footgun: ok — POSIX process-group SIGTERM (guarded by _IS_WINDOWS above)
                 except ProcessLookupError:
                     return
 
@@ -756,7 +812,9 @@ class LocalEnvironment(BaseEnvironment):
 
                 try:
                     # POSIX-only: _IS_WINDOWS is handled by the outer branch.
-                    os.killpg(pgid, signal.SIGKILL)  # windows-footgun: ok — POSIX process-group SIGKILL
+                    os.killpg(
+                        pgid, signal.SIGKILL
+                    )  # windows-footgun: ok — POSIX process-group SIGKILL
                 except ProcessLookupError:
                     return
                 _wait_for_group_exit(pgid, 2.0)

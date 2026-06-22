@@ -61,6 +61,7 @@ class PricingEntry:
     cache_read_cost_per_million: Optional[Decimal] = None
     cache_write_cost_per_million: Optional[Decimal] = None
     request_cost: Optional[Decimal] = None
+    currency: str = "USD"
     source: CostSource = "none"
     source_url: Optional[str] = None
     pricing_version: Optional[str] = None
@@ -73,6 +74,8 @@ class CostResult:
     status: CostStatus
     source: CostSource
     label: str
+    currency: str = "USD"
+    cache_billable: bool = False
     fetched_at: Optional[datetime] = None
     pricing_version: Optional[str] = None
     notes: tuple[str, ...] = ()
@@ -378,37 +381,86 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source_url="https://platform.claude.com/docs/en/about-claude/pricing",
         pricing_version="anthropic-pricing-2026-05",
     ),
-    # DeepSeek
+    # ── DeepSeek (official API, api.deepseek.com) ─────────────────────────
+    # deepseek-chat and deepseek-reasoner are server-side aliases for
+    # the non-thinking / thinking modes of deepseek-v4-flash and share
+    # the same pricing + cache semantics.
+    # Source: https://api-docs.deepseek.com/quick_start/pricing
+    # Cache hit price reduced to 1/10 of launch price effective 2026/04/26.
     (
         "deepseek",
         "deepseek-chat",
     ): PricingEntry(
-        input_cost_per_million=Decimal("0.14"),
-        output_cost_per_million=Decimal("0.28"),
+        input_cost_per_million=Decimal("1"),
+        output_cost_per_million=Decimal("2"),
+        cache_read_cost_per_million=Decimal("0.02"),
+        currency="CNY",
         source="official_docs_snapshot",
         source_url="https://api-docs.deepseek.com/quick_start/pricing",
-        pricing_version="deepseek-pricing-2026-03-16",
+        pricing_version="deepseek-pricing-2026-05-29",
     ),
     (
         "deepseek",
         "deepseek-reasoner",
     ): PricingEntry(
-        input_cost_per_million=Decimal("0.55"),
-        output_cost_per_million=Decimal("2.19"),
+        input_cost_per_million=Decimal("1"),
+        output_cost_per_million=Decimal("2"),
+        cache_read_cost_per_million=Decimal("0.02"),
+        currency="CNY",
         source="official_docs_snapshot",
         source_url="https://api-docs.deepseek.com/quick_start/pricing",
-        pricing_version="deepseek-pricing-2026-03-16",
+        pricing_version="deepseek-pricing-2026-05-29",
     ),
     (
         "deepseek",
         "deepseek-v4-pro",
     ): PricingEntry(
-        input_cost_per_million=Decimal("1.74"),
-        output_cost_per_million=Decimal("3.48"),
-        cache_read_cost_per_million=Decimal("0.0145"),
+        input_cost_per_million=Decimal("3"),
+        output_cost_per_million=Decimal("6"),
+        cache_read_cost_per_million=Decimal("0.025"),
+        currency="CNY",
         source="official_docs_snapshot",
         source_url="https://api-docs.deepseek.com/quick_start/pricing",
-        pricing_version="deepseek-pricing-2026-05-12",
+        pricing_version="deepseek-pricing-2026-05-29",
+    ),
+    (
+        "deepseek",
+        "deepseek-v4-flash",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("1"),
+        output_cost_per_million=Decimal("2"),
+        cache_read_cost_per_million=Decimal("0.02"),
+        currency="CNY",
+        source="official_docs_snapshot",
+        source_url="https://api-docs.deepseek.com/quick_start/pricing",
+        pricing_version="deepseek-pricing-2026-05-29",
+    ),
+    # ── Alibaba Cloud Model Studio (DashScope) DeepSeek ─────────────────
+    # Pricing in CNY (¥) per 1M tokens. Source: bailian console model
+    # marketplace detail pages.
+    (
+        "alibaba",
+        "deepseek-v4-flash",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("1"),
+        output_cost_per_million=Decimal("2"),
+        cache_read_cost_per_million=Decimal("0.2"),
+        currency="CNY",
+        source="official_docs_snapshot",
+        source_url="https://bailian.console.aliyun.com/cn-beijing/?tab=model#/model-market/detail/deepseek-v4-flash",
+        pricing_version="alibaba-dashscope-pricing-2026-05-29",
+    ),
+    (
+        "alibaba",
+        "deepseek-v4-pro",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("12"),
+        output_cost_per_million=Decimal("24"),
+        cache_read_cost_per_million=Decimal("1"),
+        currency="CNY",
+        source="official_docs_snapshot",
+        source_url="https://bailian.console.aliyun.com/cn-beijing/?tab=model#/model-market/detail/deepseek-v4-pro",
+        pricing_version="alibaba-dashscope-pricing-2026-05-29",
     ),
     # Google Gemini
     (
@@ -587,7 +639,17 @@ def resolve_billing_route(
         return BillingRoute(provider="openai", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
     if provider_name in {"minimax", "minimax-cn"}:
         return BillingRoute(provider=provider_name, model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
+    # ── Alibaba Cloud Model Studio (DashScope) ─────────────────────
+    if provider_name in {"alibaba", "dashscope", "aliyun"}:
+        # Alibaba has its own per-model CNY pricing entries in
+        # _OFFICIAL_DOCS_PRICING (keyed by "alibaba" provider).
+        return BillingRoute(provider="alibaba", model=model.split("/")[-1] if model else "", base_url=base_url or "", billing_mode="official_docs_snapshot")
     if provider_name in {"custom", "local"} or (base and "localhost" in base):
+        # DashScope / Alibaba Cloud hosts both DeepSeek and its own models.
+        # Route DeepSeek models via Alibaba so cache pricing is correct
+        # (Alibaba charges ¥0.2/M for v4-flash cache, not DeepSeek's ¥0.02).
+        if base and ("dashscope" in base or "aliyun" in base) and model.startswith("deepseek"):
+            return BillingRoute(provider="alibaba", model=model.split("/")[-1] if model else "", base_url=base_url or "", billing_mode="official_docs_snapshot")
         return BillingRoute(provider=provider_name or "custom", model=model, base_url=base_url or "", billing_mode="unknown")
     return BillingRoute(provider=provider_name or "unknown", model=model.split("/")[-1] if model else "", base_url=base_url or "", billing_mode="unknown")
 
@@ -706,6 +768,73 @@ def _pricing_entry_from_metadata(
     )
 
 
+def _load_custom_pricing() -> Dict[str, PricingEntry]:
+    """Load user-defined model pricing from config.
+
+    Sources (in order, later overrides earlier):
+    1. ``model.custom_pricing`` — keyed by bare model name
+    2. ``custom_providers[].models[].custom_pricing`` — keyed by
+       ``provider_name/model_name`` for fine-grained per-provider control
+
+    Only models listed here will show cost/cache in the status bar.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config()
+        entries: dict[str, PricingEntry] = {}
+
+        def _build_entry(pricing: dict) -> Optional[PricingEntry]:
+            if not isinstance(pricing, dict):
+                return None
+            input_ = _to_decimal(pricing.get("input_cost_per_million"))
+            output_ = _to_decimal(pricing.get("output_cost_per_million"))
+            if input_ is None and output_ is None:
+                return None
+            return PricingEntry(
+                input_cost_per_million=input_,
+                output_cost_per_million=output_,
+                cache_read_cost_per_million=_to_decimal(
+                    pricing.get("cache_read_cost_per_million")
+                ),
+                cache_write_cost_per_million=_to_decimal(
+                    pricing.get("cache_write_cost_per_million")
+                ),
+                request_cost=_to_decimal(pricing.get("request_cost")),
+                currency=pricing.get("currency", "USD"),
+                source="user_override",
+            )
+
+        # Source 1: model.custom_pricing (bare model name)
+        model_cp = config.get("model", {}).get("custom_pricing", {}) or {}
+        for model_name, pricing in model_cp.items():
+            entry = _build_entry(pricing)
+            if entry:
+                entries[model_name] = entry
+
+        # Source 2: custom_providers[*].models[*].custom_pricing
+        # Keyed by "provider_name/model_name" for per-provider precision.
+        providers = config.get("custom_providers", []) or []
+        for prov in providers:
+            prov_name = prov.get("name", "") if isinstance(prov, dict) else ""
+            if not prov_name:
+                continue
+            models = prov.get("models", {}) or {}
+            for model_key, model_cfg in models.items():
+                if not isinstance(model_cfg, dict):
+                    continue
+                cp = model_cfg.get("custom_pricing")
+                if not cp or not isinstance(cp, dict):
+                    continue
+                entry = _build_entry(cp)
+                if entry:
+                    entries[f"{prov_name}/{model_key}"] = entry
+
+        return entries
+    except Exception:
+        return {}
+
+
 def get_pricing_entry(
     model_name: str,
     provider: Optional[str] = None,
@@ -722,6 +851,22 @@ def get_pricing_entry(
             source="none",
             pricing_version="included-route",
         )
+
+    # User-configured pricing in config.yaml[custom_pricing] takes
+    # priority over all other sources.  Match order:
+    #   1. "provider/model" exact match (from custom_providers[*].models[*])
+    #   2. bare model name (from model.custom_pricing)
+    #   3. original model_name as passed in
+    custom = _load_custom_pricing()
+    if custom:
+        provider_model = f"{route.provider}/{route.model}"
+        if provider_model in custom:
+            return custom[provider_model]
+        if route.model in custom:
+            return custom[route.model]
+        if model_name in custom:
+            return custom[model_name]
+
     if route.provider == "openrouter":
         return _openrouter_pricing_entry(route)
     if route.base_url:
@@ -786,6 +931,10 @@ def normalize_usage(
         cache_read_tokens = _to_int(getattr(details, "cached_tokens", 0) if details else 0)
         if not cache_read_tokens:
             cache_read_tokens = _to_int(getattr(response_usage, "cache_read_input_tokens", 0))
+        if not cache_read_tokens:
+            # DeepSeek-specific custom fields: prompt_cache_hit_tokens (returned
+            # alongside prompt_cache_miss_tokens as the cache hit breakdown)
+            cache_read_tokens = _to_int(getattr(response_usage, "prompt_cache_hit_tokens", 0))
         cache_write_tokens = _to_int(
             getattr(details, "cache_write_tokens", 0) if details else 0
         )
@@ -857,6 +1006,12 @@ def estimate_usage_cost(
                 notes=("cache-write pricing unavailable for route",),
             )
 
+    # Price of 0 means "free" — don't show cost or cache for this model
+    if entry.input_cost_per_million == _ZERO:
+        return CostResult(amount_usd=None, status="unknown", source=entry.source, label="n/a")
+    if entry.output_cost_per_million == _ZERO:
+        return CostResult(amount_usd=None, status="unknown", source=entry.source, label="n/a")
+
     if entry.input_cost_per_million is not None:
         amount += Decimal(usage.input_tokens) * entry.input_cost_per_million / _ONE_MILLION
     if entry.output_cost_per_million is not None:
@@ -869,7 +1024,8 @@ def estimate_usage_cost(
         amount += Decimal(usage.request_count) * entry.request_cost
 
     status: CostStatus = "estimated"
-    label = f"~${amount:.2f}"
+    currency_symbol = "¥" if entry.currency == "CNY" else "$"
+    label = f"~{currency_symbol}{amount:.2f}"
     if entry.source == "none" and amount == _ZERO:
         status = "included"
         label = "included"
@@ -882,6 +1038,8 @@ def estimate_usage_cost(
         status=status,
         source=entry.source,
         label=label,
+        currency=entry.currency,
+        cache_billable=entry.cache_read_cost_per_million is not None and entry.cache_read_cost_per_million > _ZERO,
         fetched_at=entry.fetched_at,
         pricing_version=entry.pricing_version,
         notes=tuple(notes),
@@ -941,4 +1099,4 @@ def format_token_count_compact(value: int) -> str:
                 text = text.rstrip("0").rstrip(".")
             return f"{sign}{text}{suffix}"
 
-    return f"{value:,}"
+    return f"{value:,}"

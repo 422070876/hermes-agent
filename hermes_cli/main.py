@@ -11928,6 +11928,33 @@ def main():
     except Exception:
         pass
 
+    # Change working directory to Hermes home so terminal tool starts there.
+    try:
+        from hermes_constants import get_hermes_home
+        home = str(get_hermes_home())
+        if home:
+            os.chdir(home)
+    except Exception:
+        pass
+
+    # Change working directory to Hermes home so terminal tool starts there.
+    try:
+        from hermes_constants import get_hermes_home
+        home = str(get_hermes_home())
+        if home:
+            os.chdir(home)
+    except Exception:
+        pass
+
+    # Change working directory to Hermes home so terminal tool starts there.
+    try:
+        from hermes_constants import get_hermes_home
+        home = str(get_hermes_home())
+        if home:
+            os.chdir(home)
+    except Exception:
+        pass
+
     if _try_termux_fast_tui_launch():
         return
     if _try_termux_fast_cli_launch():

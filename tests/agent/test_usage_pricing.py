@@ -219,12 +219,7 @@ def test_nous_portal_pricing_preserves_vendor_prefixed_model_ids(monkeypatch):
 
 
 def test_deepseek_v4_pro_pricing_entry_exists():
-    """Regression test: deepseek-v4-pro must have a pricing entry.
-
-    Before this fix, deepseek-v4-pro sessions showed as unknown cost
-    in hermes insights because the _OFFICIAL_DOCS_PRICING table had no
-    entry for that model.  See #24218.
-    """
+    """Ensure deepseek-v4-pro has a hardcoded pricing entry (CNY)."""
     entry = get_pricing_entry(
         "deepseek-v4-pro",
         provider="deepseek",
@@ -233,13 +228,14 @@ def test_deepseek_v4_pro_pricing_entry_exists():
     assert entry is not None
     assert entry.input_cost_per_million is not None
     assert entry.output_cost_per_million is not None
-    assert float(entry.input_cost_per_million) == 1.74
-    assert float(entry.output_cost_per_million) == 3.48
-    assert float(entry.cache_read_cost_per_million) == 0.0145
+    assert float(entry.input_cost_per_million) == 3.0
+    assert float(entry.output_cost_per_million) == 6.0
+    assert float(entry.cache_read_cost_per_million) == 0.025
+    assert entry.currency == "CNY"
 
 
 def test_deepseek_v4_pro_estimate_usage_cost():
-    """Ensure deepseek-v4-pro sessions get a dollar estimate, not unknown."""
+    """Ensure deepseek-v4-pro sessions get a CNY estimate, not unknown."""
     result = estimate_usage_cost(
         "deepseek-v4-pro",
         CanonicalUsage(input_tokens=1000000, output_tokens=500000),

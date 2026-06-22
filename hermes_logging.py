@@ -506,6 +506,18 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
         # so the next emit doesn't mistake it for external rotation.
         self._record_stream_stat()
 
+    def rotate(self, source, dest):
+        try:
+            super().rotate(source, dest)
+        except PermissionError:
+            if os.name == "nt":
+                import shutil
+
+                shutil.copy2(source, dest)
+                with open(source, "wb"):
+                    pass
+            else:
+                raise
 
 def _add_rotating_handler(
     logger: logging.Logger,
