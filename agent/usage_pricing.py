@@ -13,6 +13,7 @@ DEFAULT_PRICING = {"input": 0.0, "output": 0.0}
 
 _ZERO = Decimal("0")
 _ONE_MILLION = Decimal("1000000")
+_NOUS_DEFAULT_BASE_URL = "https://inference-api.nousresearch.com/v1"
 
 CostStatus = Literal["actual", "estimated", "included", "unknown"]
 CostSource = Literal[
@@ -502,6 +503,8 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
     ): PricingEntry(
         input_cost_per_million=Decimal("15.00"),
         output_cost_per_million=Decimal("75.00"),
+        cache_read_cost_per_million=Decimal("1.50"),
+        cache_write_cost_per_million=Decimal("18.75"),
         source="official_docs_snapshot",
         source_url="https://aws.amazon.com/bedrock/pricing/",
         pricing_version="bedrock-pricing-2026-04",
@@ -512,6 +515,8 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
     ): PricingEntry(
         input_cost_per_million=Decimal("3.00"),
         output_cost_per_million=Decimal("15.00"),
+        cache_read_cost_per_million=Decimal("0.30"),
+        cache_write_cost_per_million=Decimal("3.75"),
         source="official_docs_snapshot",
         source_url="https://aws.amazon.com/bedrock/pricing/",
         pricing_version="bedrock-pricing-2026-04",
@@ -522,6 +527,8 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
     ): PricingEntry(
         input_cost_per_million=Decimal("3.00"),
         output_cost_per_million=Decimal("15.00"),
+        cache_read_cost_per_million=Decimal("0.30"),
+        cache_write_cost_per_million=Decimal("3.75"),
         source="official_docs_snapshot",
         source_url="https://aws.amazon.com/bedrock/pricing/",
         pricing_version="bedrock-pricing-2026-04",
@@ -532,6 +539,8 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
     ): PricingEntry(
         input_cost_per_million=Decimal("0.80"),
         output_cost_per_million=Decimal("4.00"),
+        cache_read_cost_per_million=Decimal("0.08"),
+        cache_write_cost_per_million=Decimal("1.00"),
         source="official_docs_snapshot",
         source_url="https://aws.amazon.com/bedrock/pricing/",
         pricing_version="bedrock-pricing-2026-04",
@@ -622,6 +631,8 @@ def resolve_billing_route(
         return BillingRoute(provider="openai-codex", model=model, base_url=base_url or "", billing_mode="subscription_included")
     if provider_name == "openrouter" or base_url_host_matches(base_url or "", "openrouter.ai"):
         return BillingRoute(provider="openrouter", model=model, base_url=base_url or "", billing_mode="official_models_api")
+    if provider_name == "nous" or base_url_host_matches(base_url or "", "inference-api.nousresearch.com"):
+        return BillingRoute(provider="nous", model=model, base_url=base_url or _NOUS_DEFAULT_BASE_URL, billing_mode="official_models_api")
     if provider_name == "anthropic":
         return BillingRoute(provider="anthropic", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
     if provider_name == "openai":
@@ -641,6 +652,26 @@ def resolve_billing_route(
             return BillingRoute(provider="alibaba", model=model.split("/")[-1] if model else "", base_url=base_url or "", billing_mode="official_docs_snapshot")
         return BillingRoute(provider=provider_name or "custom", model=model, base_url=base_url or "", billing_mode="unknown")
     return BillingRoute(provider=provider_name or "unknown", model=model.split("/")[-1] if model else "", base_url=base_url or "", billing_mode="unknown")
+
+
+def _normalize_bedrock_model_name(model: str) -> str:
+    """Normalize a Bedrock model id to its bare foundation-model form.
+
+    Bedrock cross-region inference profiles prefix the foundation model id
+    with a region scope (``us.`` / ``global.`` / ``eu.`` / ``ap.`` / ``jp.``),
+    e.g. ``us.anthropic.claude-opus-4-7``.  The pricing table is keyed on the
+    bare ``anthropic.claude-*`` id, so the prefix must be stripped before the
+    lookup or every cross-region session prices as unknown.  Mirrors the
+    prefix list in ``bedrock_adapter.is_anthropic_bedrock_model``.  Also
+    normalizes dot-notation version numbers (``4.7`` → ``4-7``).
+    """
+    name = model.lower().strip()
+    for prefix in ("us.", "global.", "eu.", "ap.", "jp."):
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+            break
+    name = re.sub(r"(\d+)\.(\d+)", r"\1-\2", name)
+    return name
 
 
 def _normalize_anthropic_model_name(model: str) -> str:
@@ -671,8 +702,16 @@ def _lookup_official_docs_pricing(route: BillingRoute) -> Optional[PricingEntry]
         normalized = _normalize_anthropic_model_name(model)
         if normalized != model:
             entry = _OFFICIAL_DOCS_PRICING.get((route.provider, normalized))
-        if entry:
-            return entry
+            if entry:
+                return entry
+    # Bedrock cross-region inference profiles carry a region prefix
+    # (us./global./eu./...) that the bare pricing keys don't have.
+    if route.provider == "bedrock":
+        normalized = _normalize_bedrock_model_name(model)
+        if normalized != model:
+            entry = _OFFICIAL_DOCS_PRICING.get((route.provider, normalized))
+            if entry:
+                return entry
     return None
 
 
@@ -1060,4 +1099,4 @@ def format_token_count_compact(value: int) -> str:
                 text = text.rstrip("0").rstrip(".")
             return f"{sign}{text}{suffix}"
 
-    return f"{value:,}"
+    return f"{value:,}"

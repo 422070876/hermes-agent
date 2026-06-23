@@ -215,25 +215,39 @@ def build_top_level_parser():
     )
     _inherited_flag(
         parser,
+        "--safe-mode",
+        action="store_true",
+        default=False,
+        help="Troubleshooting mode: disable ALL customizations — user config, AGENTS.md/memory injection, plugins, and MCP servers (implies --ignore-user-config and --ignore-rules)",
+    )
+    _inherited_flag(
+        parser,
         "--tui",
         action="store_true",
         default=False,
         help="Launch the modern TUI instead of the classic REPL",
     )
     _inherited_flag(
-        parser,
-        "--cli",
-        action="store_true",
-        default=False,
-        help="Force the classic prompt_toolkit REPL (overrides display.interface=tui)",
+    parser,
+    "--cli",
+    action="store_true",
+    default=False,
+    help="Force the classic prompt_toolkit REPL (overrides display.interface=tui)",
     )
     _inherited_flag(
-        parser,
-        "--dev",
-        dest="tui_dev",
-        action="store_true",
-        default=False,
-        help="With --tui: run TypeScript sources via tsx (skip dist build)",
+    parser,
+    "--simple-mode",
+    action="store_true",
+    default=False,
+    help="Single-threaded mode: disable parallel tool execution, sub-agent delegation, spinner thread, and API-call threading",
+    )
+    _inherited_flag(
+    parser,
+    "--dev",
+    dest="tui_dev",
+    action="store_true",
+    default=False,
+    help="With --tui: run TypeScript sources via tsx (skip dist build)",
     )
 
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
@@ -366,6 +380,13 @@ def build_top_level_parser():
         default=argparse.SUPPRESS,
         help="Skip auto-injection of AGENTS.md, SOUL.md, .cursorrules, memory, and preloaded skills. Combine with --ignore-user-config for a fully isolated run.",
     )
+    _inherited_flag(
+        chat_parser,
+        "--safe-mode",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Troubleshooting mode: disable ALL customizations — user config, AGENTS.md/memory injection, plugins, and MCP servers (implies --ignore-user-config and --ignore-rules). Use to isolate whether a problem comes from your setup or from Hermes itself.",
+    )
     chat_parser.add_argument(
         "--source",
         default=None,
@@ -379,17 +400,24 @@ def build_top_level_parser():
         help="Launch the modern TUI instead of the classic REPL",
     )
     _inherited_flag(
-        chat_parser,
-        "--cli",
-        action="store_true",
-        default=False,
-        help="Force the classic prompt_toolkit REPL (overrides display.interface=tui)",
+    chat_parser,
+    "--cli",
+    action="store_true",
+    default=False,
+    help="Force the classic prompt_toolkit REPL (overrides display.interface=tui)",
     )
     _inherited_flag(
-        chat_parser,
-        "--dev",
-        dest="tui_dev",
-        action="store_true",
+    chat_parser,
+    "--simple-mode",
+    action="store_true",
+    default=argparse.SUPPRESS,
+    help="Single-threaded mode: disable parallel tool execution, sub-agent delegation, spinner thread, and API-call threading",
+    )
+    _inherited_flag(
+    chat_parser,
+    "--dev",
+    dest="tui_dev",
+    action="store_true",
         default=False,
         help="With --tui: run TypeScript sources via tsx (skip dist build)",
     )

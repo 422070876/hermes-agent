@@ -1,21 +1,54 @@
 diff --git a/README.zh-CN.md b/README.zh-CN.md
-index 59b1268f8..f3efc9809 100644
+index 5ebfe1a7c..a334066d9 100644
 --- a/README.zh-CN.md
 +++ b/README.zh-CN.md
 @@ -39,7 +39,7 @@ curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
  
  > **Android / Termux：** 已测试的手动安装路径请参考 [Termux 指南](https://hermes-agent.nousresearch.com/docs/getting-started/termux)。在 Termux 上，Hermes 会安装精选的 `.[termux]` 扩展，因为完整的 `.[all]` 扩展会拉取 Android 不兼容的语音依赖。
  >
--> **Windows：** 原生 Windows 不受支持。请安装 [WSL2](https://learn.microsoft.com/zh-cn/windows/wsl/install) 并运行上述命令。
+-> **Windows：** 在 PowerShell 中运行：
 +> **Windows：** 原生 Windows 已通过 [windows-patches](windows-patches/) 得到显著改进 — 浏览器工具、Git Bash 检测、终端清理、日志轮转均原生可用。详情请参见 `windows-patches/WINDOWS_COMPAT.md`。
+ > ```powershell
+ > iex (irm https://hermes-agent.nousresearch.com/install.ps1)
+ > ```
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index ffefcee5e..76af479eb 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -223,7 +223,8 @@ def init_agent(
+     checkpoint_max_total_size_mb: int = 500,
+     checkpoint_max_file_size_mb: int = 10,
+     pass_session_id: bool = False,
+-):
++    simple_mode: bool = False,
++    ):
+     """
+     Initialize the AI Agent.
  
- 安装后：
+@@ -406,7 +407,8 @@ def init_agent(
+     # each message leaks one OS thread and the process eventually exhausts
+     # the system thread limit (RuntimeError: can't start new thread).
+     if (agent.provider == "openrouter" or agent._is_openrouter_url()) and \
+-            not _ra()._openrouter_prewarm_done.is_set():
++            not _ra()._openrouter_prewarm_done.is_set() and \
++            not simple_mode:
+         _ra()._openrouter_prewarm_done.set()
+         threading.Thread(
+             target=fetch_model_metadata,
+@@ -414,6 +416,8 @@ def init_agent(
+             name="openrouter-prewarm",
+         ).start()
  
++    agent._simple_mode = simple_mode
++
+     agent.tool_progress_callback = tool_progress_callback
+     agent.tool_start_callback = tool_start_callback
+     agent.tool_complete_callback = tool_complete_callback
 diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
-index 3e4e92a33..bcefe2824 100644
+index 92d521b16..c19ff7455 100644
 --- a/agent/agent_runtime_helpers.py
 +++ b/agent/agent_runtime_helpers.py
-@@ -1339,6 +1339,7 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
+@@ -1420,6 +1420,7 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
          keepalive_http = agent._build_keepalive_http_client(client_kwargs.get("base_url", ""))
          if keepalive_http is not None:
              client_kwargs["http_client"] = keepalive_http
@@ -23,52 +56,94 @@ index 3e4e92a33..bcefe2824 100644
      # Uses the module-level `OpenAI` name, resolved lazily on first
      # access via __getattr__ below. Tests patch via `run_agent.OpenAI`.
      client = _ra().OpenAI(**client_kwargs)
-@@ -2044,25 +2045,25 @@ def copy_reasoning_content_for_api(agent, source_msg: dict, api_msg: dict) -> No
-     if source_msg.get("role") != "assistant":
-         return
+diff --git a/agent/chat_completion_helpers.py b/agent/chat_completion_helpers.py
+index cee392caa..32d8d18ae 100644
+--- a/agent/chat_completion_helpers.py
++++ b/agent/chat_completion_helpers.py
+@@ -355,6 +355,13 @@ def interruptible_api_call(agent, api_kwargs: dict):
+     _call_start = time.time()
+     agent._touch_activity("waiting for non-streaming API response")
  
--    # 1. Explicit reasoning_content already set — preserve it verbatim
--    # (includes DeepSeek/Kimi's own space-placeholder written at creation
--    # time, and any valid reasoning content from the same provider).
--    #
--    # Exception: sessions persisted BEFORE #17341 have empty-string
--    # placeholders pinned at creation time. DeepSeek V4 Pro rejects
--    # those with HTTP 400. When the active provider enforces the
--    # thinking-mode echo, upgrade "" → " " on replay so stale history
--    # doesn't 400 the user on the next turn.
-+    # reasoning_content is a response-only field. Re-sending it:
-+    #   (a) burns billable prompt tokens (~500 tokens per reasoning turn)
-+    #   (b) breaks the byte-stable prefix that DeepSeek's prompt cache relies on
-+    #   (c) inflates every request with content the model doesn't need to re-read
-+    # Only send it back when the provider strictly requires it for the next turn
-+    # (DeepSeek / Kimi / MiMo thinking mode).
-+    if not agent._needs_thinking_reasoning_pad():
-+        api_msg.pop("reasoning_content", None)
-+        return
++    # simple_mode: call directly in current thread, no threading needed
++    if getattr(agent, "_simple_mode", False):
++        _call()
++        if result["error"] is not None:
++            raise result["error"]
++        return result["response"]
 +
-+    # --- Providers that require reasoning_content echo-back ---
-+    needs_thinking_pad = True
-+
-+    # 1. Explicit reasoning_content already set - preserve or pad it
-     existing = source_msg.get("reasoning_content")
-     if isinstance(existing, str):
--        if existing == "" and agent._needs_thinking_reasoning_pad():
--            api_msg["reasoning_content"] = " "
--        else:
--            api_msg["reasoning_content"] = existing
-+        api_msg["reasoning_content"] = " " if existing == "" else existing
-         return
+     t = threading.Thread(target=_call, daemon=True)
+     t.start()
+     _poll_count = 0
+@@ -1706,10 +1713,17 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
+                     on_tool_start=_on_tool,
+                     on_reasoning_delta=_on_reasoning if agent.reasoning_callback or agent.stream_delta_callback else None,
+                     on_interrupt_check=lambda: agent._interrupt_requested,
+-                )
++)
+             except Exception as e:
+                 result["error"] = e
  
--    needs_thinking_pad = agent._needs_thinking_reasoning_pad()
--
-     # 2. Cross-provider poisoned history (#15748): on DeepSeek/Kimi,
-     # if the source turn has tool_calls AND a 'reasoning' field but no
-     # 'reasoning_content' key, the 'reasoning' text was written by a
++        # simple_mode: call directly, no threading
++        if getattr(agent, "_simple_mode", False):
++            _bedrock_call()
++            if result["error"] is not None:
++                raise result["error"]
++            return result["response"]
++
+         t = threading.Thread(target=_bedrock_call, daemon=True)
+         t.start()
+         while t.is_alive():
+@@ -2562,6 +2576,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
+         else:
+             _stream_stale_timeout = _stream_stale_timeout_base
+ 
++    # simple_mode: call directly, no threading
++    if getattr(agent, "_simple_mode", False):
++        _call()
++        if result["response"] is not None:
++            return result["response"]
++        if result["error"] is not None:
++            raise result["error"]
++
+     t = threading.Thread(target=_call, daemon=True)
+     t.start()
+     _last_heartbeat = time.time()
 diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
-index 330d37df2..2741e1542 100644
+index 8726ba9bd..6e7089979 100644
 --- a/agent/conversation_loop.py
 +++ b/agent/conversation_loop.py
-@@ -1999,8 +1999,9 @@ def run_conversation(
+@@ -330,8 +330,20 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
+ 
+     # First turn of a new session (or recovering from a broken stored
+     # prompt) — build from scratch.
+-    agent._cached_system_prompt = agent._build_system_prompt(system_message)
+ 
++    # One-shot skill organisation: if there are unorganised skills (from a
++    # fresh install or upgrade), classify them via LLM and move into
++    # category directories before building the system prompt.  Runs at most
++    # once per HERMES_HOME — a sentinel file prevents re-runs.
++    try:
++        from agent.skill_organizer import needs_organize, organize_skills
++        if needs_organize():
++            logger.info("Unorganised skills detected; running auto-classification.")
++            organize_skills(agent)
++    except Exception as _org_exc:
++        logger.warning("Skill organisation failed (non-blocking): %s", _org_exc)
++
++    agent._cached_system_prompt = agent._build_system_prompt(system_message)
+     # Plugin hook: on_session_start — fired once when a brand-new
+     # session is created (not on continuation).  Plugins can use this
+     # to initialise session-scoped state (e.g. warm a memory cache).
+@@ -918,7 +930,7 @@ def run_conversation(
+                 # CLI TUI mode: use prompt_toolkit widget instead of raw spinner
+                 # (works in both streaming and non-streaming modes)
+                 agent.thinking_callback(f"{face} {verb}...")
+-            elif not agent._has_stream_consumers() and agent._should_start_quiet_spinner():
++            elif not agent._simple_mode and not agent._has_stream_consumers() and agent._should_start_quiet_spinner():
+                 # Raw KawaiiSpinner only when no streaming consumers and the
+                 # spinner output has a safe sink.
+                 spinner_type = random.choice(['brain', 'sparkle', 'pulse', 'moon', 'star'])
+@@ -1855,8 +1867,9 @@ def run_conversation(
  
                      # Log API call details for debugging/observability
                      _cache_pct = ""
@@ -80,7 +155,7 @@ index 330d37df2..2741e1542 100644
                      logger.info(
                          "API call #%d: model=%s provider=%s in=%d out=%d total=%d latency=%.1fs%s",
                          agent.session_api_calls, agent.model, agent.provider or "unknown",
-@@ -3586,9 +3587,13 @@ def run_conversation(
+@@ -3515,9 +3528,13 @@ def run_conversation(
                                  _retry_after = min(float(_ra_raw), 120)  # Cap at 2 minutes
                              except (TypeError, ValueError):
                                  pass
@@ -96,7 +171,7 @@ index 330d37df2..2741e1542 100644
                  else:
                      agent._buffer_status(f"⏳ Retrying in {wait_time:.1f}s (attempt {retry_count}/{max_retries})...")
                  logger.warning(
-@@ -3624,6 +3629,7 @@ def run_conversation(
+@@ -3553,6 +3570,7 @@ def run_conversation(
                              f"error retry backoff ({retry_count}/{max_retries}), "
                              f"{int(sleep_end - time.time())}s remaining"
                          )
@@ -105,10 +180,10 @@ index 330d37df2..2741e1542 100644
          # If the API call was interrupted, skip response processing
          if interrupted:
 diff --git a/agent/error_classifier.py b/agent/error_classifier.py
-index b5656232e..aa2fd167c 100644
+index c39c24a6a..c689fd5fa 100644
 --- a/agent/error_classifier.py
 +++ b/agent/error_classifier.py
-@@ -1053,8 +1053,20 @@ def _classify_by_error_code(
+@@ -1099,8 +1099,20 @@ def _classify_by_error_code(
              should_rotate_credential=True,
          )
  
@@ -131,10 +206,10 @@ index b5656232e..aa2fd167c 100644
          "payment_required",
          "insufficient_credits",
 diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
-index 26fcfaae3..8fe5d5bc0 100644
+index 923785122..9335a7ec4 100644
 --- a/agent/prompt_builder.py
 +++ b/agent/prompt_builder.py
-@@ -169,6 +169,14 @@ SESSION_SEARCH_GUIDANCE = (
+@@ -170,6 +170,14 @@ SESSION_SEARCH_GUIDANCE = (
      "asking them to repeat themselves."
  )
  
@@ -149,80 +224,19 @@ index 26fcfaae3..8fe5d5bc0 100644
  SKILLS_GUIDANCE = (
      "After completing a complex task (5+ tool calls), fixing a tricky error, "
      "or discovering a non-trivial workflow, save the approach as a "
-@@ -1259,51 +1267,16 @@ def build_skills_system_prompt(
-     if not skills_by_category:
-         result = ""
-     else:
--        index_lines = []
--        for category in sorted(skills_by_category.keys()):
--            cat_desc = category_descriptions.get(category, "")
--            if cat_desc:
--                index_lines.append(f"  {category}: {cat_desc}")
--            else:
--                index_lines.append(f"  {category}:")
--            # Deduplicate and sort skills within each category
--            seen = set()
--            for name, desc in sorted(skills_by_category[category], key=lambda x: x[0]):
--                if name in seen:
--                    continue
--                seen.add(name)
--                if desc:
--                    index_lines.append(f"    - {name}: {desc}")
--                else:
--                    index_lines.append(f"    - {name}")
--
-         result = (
--            "## Skills (mandatory)\n"
--            "Before replying, scan the skills below. If a skill matches or is even partially relevant "
--            "to your task, you MUST load it with skill_view(name) and follow its instructions. "
--            "Err on the side of loading — it is always better to have context you don't need "
--            "than to miss critical steps, pitfalls, or established workflows. "
--            "Skills contain specialized knowledge — API endpoints, tool-specific commands, "
--            "and proven workflows that outperform general-purpose approaches. Load the skill "
--            "even if you think you could handle the task with basic tools like web_search or terminal. "
--            "Skills also encode the user's preferred approach, conventions, and quality standards "
--            "for tasks like code review, planning, and testing — load them even for tasks you "
--            "already know how to do, because the skill defines how it should be done here.\n"
--            "Whenever the user asks you to configure, set up, install, enable, disable, modify, "
--            "or troubleshoot Hermes Agent itself — its CLI, config, models, providers, tools, "
--            "skills, voice, gateway, plugins, or any feature — load the `hermes-agent` skill "
--            "first. It has the actual commands (e.g. `hermes config set …`, `hermes tools`, "
--            "`hermes setup`) so you don't have to guess or invent workarounds.\n"
--            "If a skill has issues, fix it with skill_manage(action='patch').\n"
--            "After difficult/iterative tasks, offer to save as a skill. "
--            "If a skill you loaded was missing steps, had wrong commands, or needed "
--            "pitfalls you discovered, update it before finishing.\n"
--            "\n"
--            "<available_skills>\n"
--            + "\n".join(index_lines) + "\n"
--            "</available_skills>\n"
--            "\n"
--            "Only proceed without loading a skill if genuinely none are relevant to the task."
-+            "## Skills (find on demand)\n"
-+            "Use `find_skills(query)` to search for relevant skills when your task "
-+            "needs specialized knowledge — API endpoints, tool-specific commands, "
-+            "environment-specific workflows, or proven patterns. "
-+            "Load matching skills with `skill_view(name)`. "
-+            "After complex tasks (5+ tool calls), save the approach as a skill "
-+            "with skill_manage(action='create').\n"
-+            "When using a skill and finding it outdated, incomplete, or wrong, "
-+            "patch it immediately with skill_manage(action='patch').\n"
-         )
- 
-     # ── Store in LRU cache ────────────────────────────────────────────
 diff --git a/agent/system_prompt.py b/agent/system_prompt.py
-index 4038716df..c9f0647e5 100644
+index d8eaea4e3..940ead5ba 100644
 --- a/agent/system_prompt.py
 +++ b/agent/system_prompt.py
-@@ -34,6 +34,7 @@ from agent.prompt_builder import (
-     MEMORY_GUIDANCE,
+@@ -35,6 +35,7 @@ from agent.prompt_builder import (
      OPENAI_MODEL_EXECUTION_GUIDANCE,
+     PARALLEL_TOOL_CALL_GUIDANCE,
      PLATFORM_HINTS,
 +    PROJECT_CONTEXT_GUIDANCE,
      SESSION_SEARCH_GUIDANCE,
      SKILLS_GUIDANCE,
      STEER_CHANNEL_NOTE,
-@@ -294,14 +295,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None)
+@@ -408,15 +409,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None)
          context_parts.append(system_message)
  
      if not agent.skip_context_files:
@@ -231,7 +245,8 @@ index 4038716df..c9f0647e5 100644
 -        # dir — the user's real cwd there, but the install dir for the gateway
 -        # daemon, which is why the gateway sets TERMINAL_CWD.
 -        context_files_prompt = _r.build_context_files_prompt(
--            cwd=resolve_context_cwd(), skip_soul=_soul_loaded)
+-            cwd=resolve_context_cwd(), skip_soul=_soul_loaded,
+-            context_length=_ctx_len)
 -        if context_files_prompt:
 -            context_parts.append(context_files_prompt)
 +        # Instead of auto-loading AGENTS.md / CLAUDE.md / .cursorrules
@@ -242,82 +257,1414 @@ index 4038716df..c9f0647e5 100644
  
      # ── Volatile tier (changes per session/turn — never cached) ───
      volatile_parts: List[str] = []
+diff --git a/agent/tool_executor.py b/agent/tool_executor.py
+index b79c29767..ef4ef0b18 100644
+--- a/agent/tool_executor.py
++++ b/agent/tool_executor.py
+@@ -1123,16 +1123,22 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
+             if agent._should_emit_quiet_tool_messages():
+                 agent._vprint(f"  {_get_cute_tool_message_impl('read_terminal', function_args, tool_duration, result=function_result)}")
+         elif function_name == "delegate_task":
+-            tasks_arg = function_args.get("tasks")
+-            if tasks_arg and isinstance(tasks_arg, list):
+-                spinner_label = f"🔀 delegating {len(tasks_arg)} tasks · (/agents to monitor)"
++            if getattr(agent, "_simple_mode", False):
++                function_result = json.dumps({"error": "Sub-agent delegation is disabled in this session."}, ensure_ascii=False)
++                tool_duration = 0.0
++                if agent._should_emit_quiet_tool_messages():
++                    agent._vprint(f"  {_get_cute_tool_message_impl('delegate_task', function_args, tool_duration, result=function_result)}")
+             else:
+-                goal_preview = (function_args.get("goal") or "")[:30]
+-                spinner_label = (
+-                    f"🔀 {goal_preview} · (/agents to monitor)"
+-                    if goal_preview
+-                    else "🔀 delegating · (/agents to monitor)"
+-                )
++                tasks_arg = function_args.get("tasks")
++                if tasks_arg and isinstance(tasks_arg, list):
++                    spinner_label = f"🔀 delegating {len(tasks_arg)} tasks · (/agents to monitor)"
++                else:
++                    goal_preview = (function_args.get("goal") or "")[:30]
++                    spinner_label = (
++                        f"🔀 {goal_preview} · (/agents to monitor)"
++                        if goal_preview
++                        else "🔀 delegating · (/agents to monitor)"
++                    )
+             spinner = None
+             if agent._should_emit_quiet_tool_messages() and agent._should_start_quiet_spinner():
+                 face = random.choice(KawaiiSpinner.get_waiting_faces())
 diff --git a/agent/usage_pricing.py b/agent/usage_pricing.py
-index 8d6b85cd0..5167bc944 100644
+index 7c4416e5f..9bb2938d0 100644
 --- a/agent/usage_pricing.py
 +++ b/agent/usage_pricing.py
-@@ -60,6 +60,7 @@ class PricingEntry:
-     cache_read_cost_per_million: Optional[Decimal] = None
-     cache_write_cost_per_million: Optional[Decimal] = None
-     request_cost: Optional[Decimal] = None
+@@ -1,944 +1,1102 @@
+-from __future__ import annotations
+-
+-import re
+-from dataclasses import dataclass
+-from datetime import datetime, timezone
+-from decimal import Decimal
+-from typing import Any, Dict, Literal, Optional
+-
+-from agent.model_metadata import fetch_endpoint_model_metadata, fetch_model_metadata
+-from utils import base_url_host_matches
+-
+-DEFAULT_PRICING = {"input": 0.0, "output": 0.0}
+-
+-_ZERO = Decimal("0")
+-_ONE_MILLION = Decimal("1000000")
+-_NOUS_DEFAULT_BASE_URL = "https://inference-api.nousresearch.com/v1"
+-
+-CostStatus = Literal["actual", "estimated", "included", "unknown"]
+-CostSource = Literal[
+-    "provider_cost_api",
+-    "provider_generation_api",
+-    "provider_models_api",
+-    "official_docs_snapshot",
+-    "user_override",
+-    "custom_contract",
+-    "none",
+-]
+-
+-
+-@dataclass(frozen=True)
+-class CanonicalUsage:
+-    input_tokens: int = 0
+-    output_tokens: int = 0
+-    cache_read_tokens: int = 0
+-    cache_write_tokens: int = 0
+-    reasoning_tokens: int = 0
+-    request_count: int = 1
+-    raw_usage: Optional[dict[str, Any]] = None
+-
+-    @property
+-    def prompt_tokens(self) -> int:
+-        return self.input_tokens + self.cache_read_tokens + self.cache_write_tokens
+-
+-    @property
+-    def total_tokens(self) -> int:
+-        return self.prompt_tokens + self.output_tokens
+-
+-
+-@dataclass(frozen=True)
+-class BillingRoute:
+-    provider: str
+-    model: str
+-    base_url: str = ""
+-    billing_mode: str = "unknown"
+-
+-
+-@dataclass(frozen=True)
+-class PricingEntry:
+-    input_cost_per_million: Optional[Decimal] = None
+-    output_cost_per_million: Optional[Decimal] = None
+-    cache_read_cost_per_million: Optional[Decimal] = None
+-    cache_write_cost_per_million: Optional[Decimal] = None
+-    request_cost: Optional[Decimal] = None
+-    source: CostSource = "none"
+-    source_url: Optional[str] = None
+-    pricing_version: Optional[str] = None
+-    fetched_at: Optional[datetime] = None
+-
+-
+-@dataclass(frozen=True)
+-class CostResult:
+-    amount_usd: Optional[Decimal]
+-    status: CostStatus
+-    source: CostSource
+-    label: str
+-    fetched_at: Optional[datetime] = None
+-    pricing_version: Optional[str] = None
+-    notes: tuple[str, ...] = ()
+-
+-
+-_UTC_NOW = lambda: datetime.now(timezone.utc)
+-
+-
+-# Official docs snapshot entries. Models whose published pricing and cache
+-# semantics are stable enough to encode exactly.
+-_OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
+-    # ── Anthropic Claude 4.8 ─────────────────────────────────────────────
+-    # Same $5/$25 base pricing as 4.6/4.7.  Fast-mode variant is a separate
+-    # model ID with 2x premium (vs the 6x premium on older Opus generations).
+-    # Source: https://openrouter.ai/anthropic/claude-opus-4.8
+-    (
+-        "anthropic",
+-        "claude-opus-4-8",
+-    ): PricingEntry(
+-        input_cost_per_million=Decimal("5.00"),
+-        output_cost_per_million=Decimal("25.00"),
+-        cache_read_cost_per_million=Decimal("0.50"),
+-        cache_write_cost_per_million=Decimal("6.25"),
+-        source="official_docs_snapshot",
+-        source_url="https://platform.claude.com/docs/en/about-claude/pricing",
+-        pricing_version="anthropic-pricing-2026-05",
+-    ),
+-    (
+-        "anthropic",
+-        "claude-opus-4-8-fast",
+-    ): PricingEntry(
+-        input_cost_per_million=Decimal("10.00"),
+-        output_cost_per_million=Decimal("50.00"),
+-        cache_read_cost_per_million=Decimal("1.00"),
+-        cache_write_cost_per_million=Decimal("12.50"),
+-        source="official_docs_snapshot",
+-        source_url="https://openrouter.ai/anthropic/claude-opus-4.8-fast",
+-        pricing_version="anthropic-pricing-2026-05",
+-    ),
+-    # ── Anthropic Claude 4.7 ─────────────────────────────────────────────
+-    # Opus 4.5/4.6/4.7 share $5/$25 pricing (new tokenizer, up to 35% more
+-    # tokens for the same text).
+-    # Source: https://platform.claude.com/docs/en/about-claude/pricing
+-    (
+-        "anthropic",
+-        "claude-opus-4-7",
+-    ): PricingEntry(
+-        input_cost_per_million=Decimal("5.00"),
+-        output_cost_per_million=Decimal("25.00"),
+-        cache_read_cost_per_million=Decimal("0.50"),
+-        cache_write_cost_per_million=Decimal("6.25"),
+-        source="official_docs_snapshot",
+-        source_url="https://platform.claude.com/docs/en/about-claude/pricing",
+-        pricing_version="anthropic-pricing-2026-05",
+-    ),
+-    (
+-        "anthropic",
+-        "claude-opus-4-7-20250507",
+-    ): PricingEntry(
+-        input_cost_per_million=Decimal("5.00"),
+-        output_cost_per_million=Decimal("25.00"),
+-        cache_read_cost_per_million=Decimal("0.50"),
+-        cache_write_cost_per_million=Decimal("6.25"),
+-        source="official_docs_snapshot",
+-        source_url="https://platform.claude.com/docs/en/about-claude/pricing",
+-        pricing_version="anthropic-pricing-2026-05",
+-    ),
+-    # ── Anthropic Claude 4.6 ─────────────────────────────────────────────
+-    (
+-        "anthropic",
+-        "claude-opus-4-6",
+-    ): PricingEntry(
+-        input_cost_per_million=Decimal("5.00"),
+-        output_cost_per_million=Decimal("25.00"),
+-        cache_read_cost_per_million=Decimal("0.50"),
+-        cache_write_cost_per_million=Decimal("6.25"),
+-        source="official_docs_snapshot",
+-        source_url="https://platform.claude.com/docs/en/about-claude/pricing",
+-        pricing_version="anthropic-pricing-2026-05",
+-    ),
+-    (
+-        "anthropic",
+-        "claude-opus-4-6-20250414",
+-    ): PricingEntry(
+-        input_cost_per_million=Decimal("5.00"),
+-        output_cost_per_million=Decimal("25.00"),
+-        cache_read_cost_per_million=Decimal("0.50"),
+-        cache_write_cost_per_million=Decimal("6.25"),
+-        source="official_docs_snapshot",
+-        source_url="https://platform.claude.com/docs/en/about-claude/pricing",
+-        pricing_version="anthropic-pricing-2026-05",
+-    ),
+-    (
+-        "anthropic",
+-        "claude-sonnet-4-6",
+-    ): PricingEntry(
+-        input_cost_per_million=Decimal("3.00"),
+-        output_cost_per_million=Decimal("15.00"),
+-        cache_read_cost_per_million=Decimal("0.30"),
+-        cache_write_cost_per_million=Decimal("3.75"),
+-        source="official_docs_snapshot",
+-        source_url="https://platform.claude.com/docs/en/about-claude/pricing",
+-        pricing_version="anthropic-pricing-2026-05",
+-    ),
+-    (
+-        "anthropic",
+-        "claude-sonnet-4-6-20250414",
+-    ): PricingEntry(
+-        input_cost_per_million=Decimal("3.00"),
+-        output_cost_per_million=Decimal("15.00"),
+-        cache_read_cost_per_million=Decimal("0.30"),
+-        cache_write_cost_per_million=Decimal("3.75"),
+-        source="official_docs_snapshot",
+-        source_url="https://platform.claude.com/docs/en/about-claude/pricing",
+-        pricing_version="anthropic-pricing-2026-05",
+-    ),
+-    # ── Anthropic Claude 4.5 ─────────────────────────────────────────────
+-    (
+-        "anthropic",
+-        "claude-opus-4-5",
+-    ): PricingEntry(
+-        input_cost_per_million=Decimal("5.00"),
+-        output_cost_per_million=Decimal("25.00"),
+-        cache_read_cost_per_million=Decimal("0.50"),
+-        cache_write_cost_per_million=Decimal("6.25"),
+-        source="official_docs_snapshot",
+-        source_url="https://platform.claude.com/docs/en/about-claude/pricing",
+-        pricing_version="anthropic-pricing-2026-05",
+-    ),
+-    (
+-        "anthropic",
+-        "claude-sonnet-4-5",
+-    ): PricingEntry(
+-        input_cost_per_million=Decimal("3.00"),
+-        output_cost_per_million=Decimal("15.00"),
+-        cache_read_cost_per_million=Decimal("0.30"),
+-        cache_write_cost_per_million=Decimal("3.75"),
+-        source="official_docs_snapshot",
+-        source_url="https://platform.claude.com/docs/en/about-claude/pricing",
+-        pricing_version="anthropic-pricing-2026-05",
+-    ),
+-    (
+-        "anthropic",
+-        "claude-haiku-4-5",
+-    ): PricingEntry(
+-        input_cost_per_million=Decimal("1.00"),
+-        output_cost_per_million=Decimal("5.00"),
+-        cache_read_cost_per_million=Decimal("0.10"),
+-        cache_write_cost_per_million=Decimal("1.25"),
+-        source="official_docs_snapshot",
+-        source_url="https://platform.claude.com/docs/en/about-claude/pricing",
+-        pricing_version="anthropic-pricing-2026-05",
+-    ),
+-    # ── Anthropic Claude 4 / 4.1 ─────────────────────────────────────────
+-    (
+-        "anthropic",
+-        "claude-opus-4-20250514",
+-    ): PricingEntry(
+-        input_cost_per_million=Decimal("15.00"),
+-        output_cost_per_million=Decimal("75.00"),
+-        cache_read_cost_per_million=Decimal("1.50"),
+-        cache_write_cost_per_million=Decimal("18.75"),
+-        source="official_docs_snapshot",
+-        source_url="https://platform.claude.com/docs/en/about-claude/pricing",
+-        pricing_version="anthropic-pricing-2026-05",
+-    ),
+-    (
+-        "anthropic",
+-        "claude-sonnet-4-20250514",
+-    ): PricingEntry(
+-        input_cost_per_million=Decimal("3.00"),
+-        output_cost_per_million=Decimal("15.00"),
+-        cache_read_cost_per_million=Decimal("0.30"),
+-        cache_write_cost_per_million=Decimal("3.75"),
+-        source="official_docs_snapshot",
+-        source_url="https://platform.claude.com/docs/en/about-claude/pricing",
+-        pricing_version="anthropic-pricing-2026-05",
+-    ),
+-    # OpenAI
+-    (
+-        "openai",
+-        "gpt-4o",
+-    ): PricingEntry(
+-        input_cost_per_million=Decimal("2.50"),
+-        output_cost_per_million=Decimal("10.00"),
+-        cache_read_cost_per_million=Decimal("1.25"),
+-        source="official_docs_snapshot",
+-        source_url="https://openai.com/api/pricing/",
+-        pricing_version="openai-pricing-2026-03-16",
+-    ),
+-    (
+-        "openai",
+-        "gpt-4o-mini",
+-    ): PricingEntry(
+-        input_cost_per_million=Decimal("0.15"),
+-        output_cost_per_million=Decimal("0.60"),
+-        cache_read_cost_per_million=Decimal("0.075"),
+-        source="official_docs_snapshot",
+-        source_url="https://openai.com/api/pricing/",
+-        pricing_version="openai-pricing-2026-03-16",
+-    ),
+-    (
+-        "openai",
+-        "gpt-4.1",
+-    ): PricingEntry(
+-        input_cost_per_million=Decimal("2.00"),
+-        output_cost_per_million=Decimal("8.00"),
+-        cache_read_cost_per_million=Decimal("0.50"),
+-        source="official_docs_snapshot",
+-        source_url="https://openai.com/api/pricing/",
+-        pricing_version="openai-pricing-2026-03-16",
+-    ),
+-    (
+-        "openai",
+-        "gpt-4.1-mini",
+-    ): PricingEntry(
+-        input_cost_per_million=Decimal("0.40"),
+-        output_cost_per_million=Decimal("1.60"),
+-        cache_read_cost_per_million=Decimal("0.10"),
+-        source="official_docs_snapshot",
+-        source_url="https://openai.com/api/pricing/",
+-        pricing_version="openai-pricing-2026-03-16",
+-    ),
+-    (
+-        "openai",
+-        "gpt-4.1-nano",
+-    ): PricingEntry(
+-        input_cost_per_million=Decimal("0.10"),
+-        output_cost_per_million=Decimal("0.40"),
+-        cache_read_cost_per_million=Decimal("0.025"),
+-        source="official_docs_snapshot",
+-        source_url="https://openai.com/api/pricing/",
+-        pricing_version="openai-pricing-2026-03-16",
+-    ),
+-    (
+-        "openai",
+-        "o3",
+-    ): PricingEntry(
+-        input_cost_per_million=Decimal("10.00"),
+-        output_cost_per_million=Decimal("40.00"),
+-        cache_read_cost_per_million=Decimal("2.50"),
+-        source="official_docs_snapshot",
+-        source_url="https://openai.com/api/pricing/",
+-        pricing_version="openai-pricing-2026-03-16",
+-    ),
+-    (
+-        "openai",
+-        "o3-mini",
+-    ): PricingEntry(
+-        input_cost_per_million=Decimal("1.10"),
+-        output_cost_per_million=Decimal("4.40"),
+-        cache_read_cost_per_million=Decimal("0.55"),
+-        source="official_docs_snapshot",
+-        source_url="https://openai.com/api/pricing/",
+-        pricing_version="openai-pricing-2026-03-16",
+-    ),
+-    # ── Anthropic older models (pre-4.5 generation) ────────────────────────
+-    (
+-        "anthropic",
+-        "claude-3-5-sonnet-20241022",
+-    ): PricingEntry(
+-        input_cost_per_million=Decimal("3.00"),
+-        output_cost_per_million=Decimal("15.00"),
+-        cache_read_cost_per_million=Decimal("0.30"),
+-        cache_write_cost_per_million=Decimal("3.75"),
+-        source="official_docs_snapshot",
+-        source_url="https://platform.claude.com/docs/en/about-claude/pricing",
+-        pricing_version="anthropic-pricing-2026-05",
+-    ),
+-    (
+-        "anthropic",
+-        "claude-3-5-haiku-20241022",
+-    ): PricingEntry(
+-        input_cost_per_million=Decimal("0.80"),
+-        output_cost_per_million=Decimal("4.00"),
+-        cache_read_cost_per_million=Decimal("0.08"),
+-        cache_write_cost_per_million=Decimal("1.00"),
+-        source="official_docs_snapshot",
+-        source_url="https://platform.claude.com/docs/en/about-claude/pricing",
+-        pricing_version="anthropic-pricing-2026-05",
+-    ),
+-    (
+-        "anthropic",
+-        "claude-3-opus-20240229",
+-    ): PricingEntry(
+-        input_cost_per_million=Decimal("15.00"),
+-        output_cost_per_million=Decimal("75.00"),
+-        cache_read_cost_per_million=Decimal("1.50"),
+-        cache_write_cost_per_million=Decimal("18.75"),
+-        source="official_docs_snapshot",
+-        source_url="https://platform.claude.com/docs/en/about-claude/pricing",
+-        pricing_version="anthropic-pricing-2026-05",
+-    ),
+-    (
+-        "anthropic",
+-        "claude-3-haiku-20240307",
+-    ): PricingEntry(
+-        input_cost_per_million=Decimal("0.25"),
+-        output_cost_per_million=Decimal("1.25"),
+-        cache_read_cost_per_million=Decimal("0.03"),
+-        cache_write_cost_per_million=Decimal("0.30"),
+-        source="official_docs_snapshot",
+-        source_url="https://platform.claude.com/docs/en/about-claude/pricing",
+-        pricing_version="anthropic-pricing-2026-05",
+-    ),
+-    # DeepSeek
+-    (
+-        "deepseek",
+-        "deepseek-chat",
+-    ): PricingEntry(
+-        input_cost_per_million=Decimal("0.14"),
+-        output_cost_per_million=Decimal("0.28"),
+-        source="official_docs_snapshot",
+-        source_url="https://api-docs.deepseek.com/quick_start/pricing",
+-        pricing_version="deepseek-pricing-2026-03-16",
+-    ),
+-    (
+-        "deepseek",
+-        "deepseek-reasoner",
+-    ): PricingEntry(
+-        input_cost_per_million=Decimal("0.55"),
+-        output_cost_per_million=Decimal("2.19"),
+-        source="official_docs_snapshot",
+-        source_url="https://api-docs.deepseek.com/quick_start/pricing",
+-        pricing_version="deepseek-pricing-2026-03-16",
+-    ),
+-    (
+-        "deepseek",
+-        "deepseek-v4-pro",
+-    ): PricingEntry(
+-        input_cost_per_million=Decimal("1.74"),
+-        output_cost_per_million=Decimal("3.48"),
+-        cache_read_cost_per_million=Decimal("0.0145"),
+-        source="official_docs_snapshot",
+-        source_url="https://api-docs.deepseek.com/quick_start/pricing",
+-        pricing_version="deepseek-pricing-2026-05-12",
+-    ),
+-    # Google Gemini
+-    (
+-        "google",
+-        "gemini-2.5-pro",
+-    ): PricingEntry(
+-        input_cost_per_million=Decimal("1.25"),
+-        output_cost_per_million=Decimal("10.00"),
+-        source="official_docs_snapshot",
+-        source_url="https://ai.google.dev/pricing",
+-        pricing_version="google-pricing-2026-03-16",
+-    ),
+-    (
+-        "google",
+-        "gemini-2.5-flash",
+-    ): PricingEntry(
+-        input_cost_per_million=Decimal("0.15"),
+-        output_cost_per_million=Decimal("0.60"),
+-        source="official_docs_snapshot",
+-        source_url="https://ai.google.dev/pricing",
+-        pricing_version="google-pricing-2026-03-16",
+-    ),
+-    (
+-        "google",
+-        "gemini-2.0-flash",
+-    ): PricingEntry(
+-        input_cost_per_million=Decimal("0.10"),
+-        output_cost_per_million=Decimal("0.40"),
+-        source="official_docs_snapshot",
+-        source_url="https://ai.google.dev/pricing",
+-        pricing_version="google-pricing-2026-03-16",
+-    ),
+-    # AWS Bedrock — pricing per the Bedrock pricing page.
+-    # Bedrock charges the same per-token rates as the model provider but
+-    # through AWS billing.  These are the on-demand prices (no commitment).
+-    # Source: https://aws.amazon.com/bedrock/pricing/
+-    (
+-        "bedrock",
+-        "anthropic.claude-opus-4-6",
+-    ): PricingEntry(
+-        input_cost_per_million=Decimal("15.00"),
+-        output_cost_per_million=Decimal("75.00"),
+-        cache_read_cost_per_million=Decimal("1.50"),
+-        cache_write_cost_per_million=Decimal("18.75"),
+-        source="official_docs_snapshot",
+-        source_url="https://aws.amazon.com/bedrock/pricing/",
+-        pricing_version="bedrock-pricing-2026-04",
+-    ),
+-    (
+-        "bedrock",
+-        "anthropic.claude-sonnet-4-6",
+-    ): PricingEntry(
+-        input_cost_per_million=Decimal("3.00"),
+-        output_cost_per_million=Decimal("15.00"),
+-        cache_read_cost_per_million=Decimal("0.30"),
+-        cache_write_cost_per_million=Decimal("3.75"),
+-        source="official_docs_snapshot",
+-        source_url="https://aws.amazon.com/bedrock/pricing/",
+-        pricing_version="bedrock-pricing-2026-04",
+-    ),
+-    (
+-        "bedrock",
+-        "anthropic.claude-sonnet-4-5",
+-    ): PricingEntry(
+-        input_cost_per_million=Decimal("3.00"),
+-        output_cost_per_million=Decimal("15.00"),
+-        cache_read_cost_per_million=Decimal("0.30"),
+-        cache_write_cost_per_million=Decimal("3.75"),
+-        source="official_docs_snapshot",
+-        source_url="https://aws.amazon.com/bedrock/pricing/",
+-        pricing_version="bedrock-pricing-2026-04",
+-    ),
+-    (
+-        "bedrock",
+-        "anthropic.claude-haiku-4-5",
+-    ): PricingEntry(
+-        input_cost_per_million=Decimal("0.80"),
+-        output_cost_per_million=Decimal("4.00"),
+-        cache_read_cost_per_million=Decimal("0.08"),
+-        cache_write_cost_per_million=Decimal("1.00"),
+-        source="official_docs_snapshot",
+-        source_url="https://aws.amazon.com/bedrock/pricing/",
+-        pricing_version="bedrock-pricing-2026-04",
+-    ),
+-    (
+-        "bedrock",
+-        "amazon.nova-pro",
+-    ): PricingEntry(
+-        input_cost_per_million=Decimal("0.80"),
+-        output_cost_per_million=Decimal("3.20"),
+-        source="official_docs_snapshot",
+-        source_url="https://aws.amazon.com/bedrock/pricing/",
+-        pricing_version="bedrock-pricing-2026-04",
+-    ),
+-    (
+-        "bedrock",
+-        "amazon.nova-lite",
+-    ): PricingEntry(
+-        input_cost_per_million=Decimal("0.06"),
+-        output_cost_per_million=Decimal("0.24"),
+-        source="official_docs_snapshot",
+-        source_url="https://aws.amazon.com/bedrock/pricing/",
+-        pricing_version="bedrock-pricing-2026-04",
+-    ),
+-    (
+-        "bedrock",
+-        "amazon.nova-micro",
+-    ): PricingEntry(
+-        input_cost_per_million=Decimal("0.035"),
+-        output_cost_per_million=Decimal("0.14"),
+-        source="official_docs_snapshot",
+-        source_url="https://aws.amazon.com/bedrock/pricing/",
+-        pricing_version="bedrock-pricing-2026-04",
+-    ),
+-    # MiniMax
+-    (
+-        "minimax",
+-        "minimax-m2.7",
+-    ): PricingEntry(
+-        input_cost_per_million=Decimal("0.30"),
+-        output_cost_per_million=Decimal("1.20"),
+-        source="official_docs_snapshot",
+-        pricing_version="minimax-pricing-2026-04",
+-    ),
+-    (
+-        "minimax-cn",
+-        "minimax-m2.7",
+-    ): PricingEntry(
+-        input_cost_per_million=Decimal("0.30"),
+-        output_cost_per_million=Decimal("1.20"),
+-        source="official_docs_snapshot",
+-        pricing_version="minimax-pricing-2026-04",
+-    ),
+-}
+-
+-
+-def _to_decimal(value: Any) -> Optional[Decimal]:
+-    if value is None:
+-        return None
+-    try:
+-        return Decimal(str(value))
+-    except Exception:
+-        return None
+-
+-
+-def _to_int(value: Any) -> int:
+-    try:
+-        return int(value or 0)
+-    except Exception:
+-        return 0
+-
+-
+-def resolve_billing_route(
+-    model_name: str,
+-    provider: Optional[str] = None,
+-    base_url: Optional[str] = None,
+-) -> BillingRoute:
+-    provider_name = (provider or "").strip().lower()
+-    base = (base_url or "").strip().lower()
+-    model = (model_name or "").strip()
+-    if not provider_name and "/" in model:
+-        inferred_provider, bare_model = model.split("/", 1)
+-        if inferred_provider in {"anthropic", "openai", "google"}:
+-            provider_name = inferred_provider
+-            model = bare_model
+-
+-    if provider_name == "openai-codex":
+-        return BillingRoute(provider="openai-codex", model=model, base_url=base_url or "", billing_mode="subscription_included")
+-    if provider_name == "openrouter" or base_url_host_matches(base_url or "", "openrouter.ai"):
+-        return BillingRoute(provider="openrouter", model=model, base_url=base_url or "", billing_mode="official_models_api")
+-    if provider_name == "nous" or base_url_host_matches(base_url or "", "inference-api.nousresearch.com"):
+-        return BillingRoute(provider="nous", model=model, base_url=base_url or _NOUS_DEFAULT_BASE_URL, billing_mode="official_models_api")
+-    if provider_name == "anthropic":
+-        return BillingRoute(provider="anthropic", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
+-    if provider_name == "openai":
+-        return BillingRoute(provider="openai", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
+-    if provider_name in {"minimax", "minimax-cn"}:
+-        return BillingRoute(provider=provider_name, model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
+-    if provider_name in {"custom", "local"} or (base and "localhost" in base):
+-        return BillingRoute(provider=provider_name or "custom", model=model, base_url=base_url or "", billing_mode="unknown")
+-    return BillingRoute(provider=provider_name or "unknown", model=model.split("/")[-1] if model else "", base_url=base_url or "", billing_mode="unknown")
+-
+-
+-def _normalize_bedrock_model_name(model: str) -> str:
+-    """Normalize a Bedrock model id to its bare foundation-model form.
+-
+-    Bedrock cross-region inference profiles prefix the foundation model id
+-    with a region scope (``us.`` / ``global.`` / ``eu.`` / ``ap.`` / ``jp.``),
+-    e.g. ``us.anthropic.claude-opus-4-7``.  The pricing table is keyed on the
+-    bare ``anthropic.claude-*`` id, so the prefix must be stripped before the
+-    lookup or every cross-region session prices as unknown.  Mirrors the
+-    prefix list in ``bedrock_adapter.is_anthropic_bedrock_model``.  Also
+-    normalizes dot-notation version numbers (``4.7`` → ``4-7``).
+-    """
+-    name = model.lower().strip()
+-    for prefix in ("us.", "global.", "eu.", "ap.", "jp."):
+-        if name.startswith(prefix):
+-            name = name[len(prefix):]
+-            break
+-    name = re.sub(r"(\d+)\.(\d+)", r"\1-\2", name)
+-    return name
+-
+-
+-def _normalize_anthropic_model_name(model: str) -> str:
+-    """Normalize Anthropic model name variants to canonical form.
+-
+-    Handles:
+-      - Dot notation: claude-opus-4.7 → claude-opus-4-7
+-      - Short aliases: claude-opus-4.7 → claude-opus-4-7
+-      - Strips anthropic/ prefix if present
+-    """
+-    name = model.lower().strip()
+-    if name.startswith("anthropic/"):
+-        name = name[len("anthropic/"):]
+-    # Normalize dots to dashes in version numbers (e.g. 4.7 → 4-7, 4.6 → 4-6)
+-    # But preserve the rest of the name structure
+-    name = re.sub(r"(\d+)\.(\d+)", r"\1-\2", name)
+-    return name
+-
+-
+-def _lookup_official_docs_pricing(route: BillingRoute) -> Optional[PricingEntry]:
+-    model = route.model.lower()
+-    # Direct lookup first
+-    entry = _OFFICIAL_DOCS_PRICING.get((route.provider, model))
+-    if entry:
+-        return entry
+-    # Try normalized name for Anthropic (handles dot-notation like opus-4.7)
+-    if route.provider == "anthropic":
+-        normalized = _normalize_anthropic_model_name(model)
+-        if normalized != model:
+-            entry = _OFFICIAL_DOCS_PRICING.get((route.provider, normalized))
+-            if entry:
+-                return entry
+-    # Bedrock cross-region inference profiles carry a region prefix
+-    # (us./global./eu./...) that the bare pricing keys don't have.
+-    if route.provider == "bedrock":
+-        normalized = _normalize_bedrock_model_name(model)
+-        if normalized != model:
+-            entry = _OFFICIAL_DOCS_PRICING.get((route.provider, normalized))
+-            if entry:
+-                return entry
+-    return None
+-
+-
+-def _openrouter_pricing_entry(route: BillingRoute) -> Optional[PricingEntry]:
+-    return _pricing_entry_from_metadata(
+-        fetch_model_metadata(),
+-        route.model,
+-        source_url="https://openrouter.ai/docs/api/api-reference/models/get-models",
+-        pricing_version="openrouter-models-api",
+-    )
+-
+-
+-def _pricing_entry_from_metadata(
+-    metadata: Dict[str, Dict[str, Any]],
+-    model_id: str,
+-    *,
+-    source_url: str,
+-    pricing_version: str,
+-) -> Optional[PricingEntry]:
+-    if model_id not in metadata:
+-        return None
+-    pricing = metadata[model_id].get("pricing") or {}
+-    prompt = _to_decimal(pricing.get("prompt"))
+-    completion = _to_decimal(pricing.get("completion"))
+-    request = _to_decimal(pricing.get("request"))
+-    cache_read = _to_decimal(
+-        pricing.get("cache_read")
+-        or pricing.get("cached_prompt")
+-        or pricing.get("input_cache_read")
+-    )
+-    cache_write = _to_decimal(
+-        pricing.get("cache_write")
+-        or pricing.get("cache_creation")
+-        or pricing.get("input_cache_write")
+-    )
+-    if prompt is None and completion is None and request is None:
+-        return None
+-
+-    def _per_token_to_per_million(value: Optional[Decimal]) -> Optional[Decimal]:
+-        if value is None:
+-            return None
+-        return value * _ONE_MILLION
+-
+-    return PricingEntry(
+-        input_cost_per_million=_per_token_to_per_million(prompt),
+-        output_cost_per_million=_per_token_to_per_million(completion),
+-        cache_read_cost_per_million=_per_token_to_per_million(cache_read),
+-        cache_write_cost_per_million=_per_token_to_per_million(cache_write),
+-        request_cost=request,
+-        source="provider_models_api",
+-        source_url=source_url,
+-        pricing_version=pricing_version,
+-        fetched_at=_UTC_NOW(),
+-    )
+-
+-
+-def get_pricing_entry(
+-    model_name: str,
+-    provider: Optional[str] = None,
+-    base_url: Optional[str] = None,
+-    api_key: Optional[str] = None,
+-) -> Optional[PricingEntry]:
+-    route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
+-    if route.billing_mode == "subscription_included":
+-        return PricingEntry(
+-            input_cost_per_million=_ZERO,
+-            output_cost_per_million=_ZERO,
+-            cache_read_cost_per_million=_ZERO,
+-            cache_write_cost_per_million=_ZERO,
+-            source="none",
+-            pricing_version="included-route",
+-        )
+-    if route.provider == "openrouter":
+-        return _openrouter_pricing_entry(route)
+-    if route.base_url:
+-        entry = _pricing_entry_from_metadata(
+-            fetch_endpoint_model_metadata(route.base_url, api_key=api_key or ""),
+-            route.model,
+-            source_url=f"{route.base_url.rstrip('/')}/models",
+-            pricing_version="openai-compatible-models-api",
+-        )
+-        if entry:
+-            return entry
+-    return _lookup_official_docs_pricing(route)
+-
+-
+-def normalize_usage(
+-    response_usage: Any,
+-    *,
+-    provider: Optional[str] = None,
+-    api_mode: Optional[str] = None,
+-) -> CanonicalUsage:
+-    """Normalize raw API response usage into canonical token buckets.
+-
+-    Handles three API shapes:
+-    - Anthropic: input_tokens/output_tokens/cache_read_input_tokens/cache_creation_input_tokens
+-    - Codex Responses: input_tokens includes cache tokens; input_tokens_details.cached_tokens separates them
+-    - OpenAI Chat Completions: prompt_tokens includes cache tokens; prompt_tokens_details.cached_tokens separates them
+-
+-    In both Codex and OpenAI modes, input_tokens is derived by subtracting cache
+-    tokens from the total — the API contract is that input/prompt totals include
+-    cached tokens and the details object breaks them out.
+-    """
+-    if not response_usage:
+-        return CanonicalUsage()
+-
+-    provider_name = (provider or "").strip().lower()
+-    mode = (api_mode or "").strip().lower()
+-
+-    if mode == "anthropic_messages" or provider_name == "anthropic":
+-        input_tokens = _to_int(getattr(response_usage, "input_tokens", 0))
+-        output_tokens = _to_int(getattr(response_usage, "output_tokens", 0))
+-        cache_read_tokens = _to_int(getattr(response_usage, "cache_read_input_tokens", 0))
+-        cache_write_tokens = _to_int(getattr(response_usage, "cache_creation_input_tokens", 0))
+-    elif mode == "codex_responses":
+-        input_total = _to_int(getattr(response_usage, "input_tokens", 0))
+-        output_tokens = _to_int(getattr(response_usage, "output_tokens", 0))
+-        details = getattr(response_usage, "input_tokens_details", None)
+-        cache_read_tokens = _to_int(getattr(details, "cached_tokens", 0) if details else 0)
+-        cache_write_tokens = _to_int(
+-            getattr(details, "cache_creation_tokens", 0) if details else 0
+-        )
+-        input_tokens = max(0, input_total - cache_read_tokens - cache_write_tokens)
+-    else:
+-        prompt_total = _to_int(getattr(response_usage, "prompt_tokens", 0))
+-        output_tokens = _to_int(getattr(response_usage, "completion_tokens", 0))
+-        details = getattr(response_usage, "prompt_tokens_details", None)
+-        # Primary: OpenAI-style prompt_tokens_details. Fallback: Anthropic-style
+-        # top-level fields that some OpenAI-compatible proxies (OpenRouter, Cline)
+-        # expose when routing Claude models — without this
+-        # fallback, cache writes are undercounted as 0 and cache reads can be
+-        # missed when the proxy only surfaces them at the top level.
+-        # Port of cline/cline#10266.
+-        cache_read_tokens = _to_int(getattr(details, "cached_tokens", 0) if details else 0)
+-        if not cache_read_tokens:
+-            cache_read_tokens = _to_int(getattr(response_usage, "cache_read_input_tokens", 0))
+-        cache_write_tokens = _to_int(
+-            getattr(details, "cache_write_tokens", 0) if details else 0
+-        )
+-        if not cache_write_tokens:
+-            cache_write_tokens = _to_int(
+-                getattr(response_usage, "cache_creation_input_tokens", 0)
+-            )
+-        input_tokens = max(0, prompt_total - cache_read_tokens - cache_write_tokens)
+-
+-    reasoning_tokens = 0
+-    output_details = getattr(response_usage, "output_tokens_details", None)
+-    if output_details:
+-        reasoning_tokens = _to_int(getattr(output_details, "reasoning_tokens", 0))
+-
+-    return CanonicalUsage(
+-        input_tokens=input_tokens,
+-        output_tokens=output_tokens,
+-        cache_read_tokens=cache_read_tokens,
+-        cache_write_tokens=cache_write_tokens,
+-        reasoning_tokens=reasoning_tokens,
+-    )
+-
+-
+-def estimate_usage_cost(
+-    model_name: str,
+-    usage: CanonicalUsage,
+-    *,
+-    provider: Optional[str] = None,
+-    base_url: Optional[str] = None,
+-    api_key: Optional[str] = None,
+-) -> CostResult:
+-    route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
+-    if route.billing_mode == "subscription_included":
+-        return CostResult(
+-            amount_usd=_ZERO,
+-            status="included",
+-            source="none",
+-            label="included",
+-            pricing_version="included-route",
+-        )
+-
+-    entry = get_pricing_entry(model_name, provider=provider, base_url=base_url, api_key=api_key)
+-    if not entry:
+-        return CostResult(amount_usd=None, status="unknown", source="none", label="n/a")
+-
+-    notes: list[str] = []
+-    amount = _ZERO
+-
+-    if usage.input_tokens and entry.input_cost_per_million is None:
+-        return CostResult(amount_usd=None, status="unknown", source=entry.source, label="n/a")
+-    if usage.output_tokens and entry.output_cost_per_million is None:
+-        return CostResult(amount_usd=None, status="unknown", source=entry.source, label="n/a")
+-    if usage.cache_read_tokens:
+-        if entry.cache_read_cost_per_million is None:
+-            return CostResult(
+-                amount_usd=None,
+-                status="unknown",
+-                source=entry.source,
+-                label="n/a",
+-                notes=("cache-read pricing unavailable for route",),
+-            )
+-    if usage.cache_write_tokens:
+-        if entry.cache_write_cost_per_million is None:
+-            return CostResult(
+-                amount_usd=None,
+-                status="unknown",
+-                source=entry.source,
+-                label="n/a",
+-                notes=("cache-write pricing unavailable for route",),
+-            )
+-
+-    if entry.input_cost_per_million is not None:
+-        amount += Decimal(usage.input_tokens) * entry.input_cost_per_million / _ONE_MILLION
+-    if entry.output_cost_per_million is not None:
+-        amount += Decimal(usage.output_tokens) * entry.output_cost_per_million / _ONE_MILLION
+-    if entry.cache_read_cost_per_million is not None:
+-        amount += Decimal(usage.cache_read_tokens) * entry.cache_read_cost_per_million / _ONE_MILLION
+-    if entry.cache_write_cost_per_million is not None:
+-        amount += Decimal(usage.cache_write_tokens) * entry.cache_write_cost_per_million / _ONE_MILLION
+-    if entry.request_cost is not None and usage.request_count:
+-        amount += Decimal(usage.request_count) * entry.request_cost
+-
+-    status: CostStatus = "estimated"
+-    label = f"~${amount:.2f}"
+-    if entry.source == "none" and amount == _ZERO:
+-        status = "included"
+-        label = "included"
+-
+-    if route.provider == "openrouter":
+-        notes.append("OpenRouter cost is estimated from the models API until reconciled.")
+-
+-    return CostResult(
+-        amount_usd=amount,
+-        status=status,
+-        source=entry.source,
+-        label=label,
+-        fetched_at=entry.fetched_at,
+-        pricing_version=entry.pricing_version,
+-        notes=tuple(notes),
+-    )
+-
+-
+-def has_known_pricing(
+-    model_name: str,
+-    provider: Optional[str] = None,
+-    base_url: Optional[str] = None,
+-    api_key: Optional[str] = None,
+-) -> bool:
+-    """Check whether we have pricing data for this model+route.
+-
+-    Uses direct lookup instead of routing through the full estimation
+-    pipeline — avoids creating dummy usage objects just to check status.
+-    """
+-    route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
+-    if route.billing_mode == "subscription_included":
+-        return True
+-    entry = get_pricing_entry(model_name, provider=provider, base_url=base_url, api_key=api_key)
+-    return entry is not None
+-
+-
+-
+-def format_duration_compact(seconds: float) -> str:
+-    if seconds < 60:
+-        return f"{seconds:.0f}s"
+-    minutes = seconds / 60
+-    if minutes < 60:
+-        return f"{minutes:.0f}m"
+-    hours = minutes / 60
+-    if hours < 24:
+-        remaining_min = int(minutes % 60)
+-        return f"{int(hours)}h {remaining_min}m" if remaining_min else f"{int(hours)}h"
+-    days = hours / 24
+-    return f"{days:.1f}d"
+-
+-
+-def format_token_count_compact(value: int) -> str:
+-    abs_value = abs(int(value))
+-    if abs_value < 1_000:
+-        return str(int(value))
+-
+-    sign = "-" if value < 0 else ""
+-    units = ((1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K"))
+-    for threshold, suffix in units:
+-        if abs_value >= threshold:
+-            scaled = abs_value / threshold
+-            if scaled < 10:
+-                text = f"{scaled:.2f}"
+-            elif scaled < 100:
+-                text = f"{scaled:.1f}"
+-            else:
+-                text = f"{scaled:.0f}"
+-            if "." in text:
+-                text = text.rstrip("0").rstrip(".")
+-            return f"{sign}{text}{suffix}"
+-
+-    return f"{value:,}"
++from __future__ import annotations
++
++import re
++from dataclasses import dataclass
++from datetime import datetime, timezone
++from decimal import Decimal
++from typing import Any, Dict, Literal, Optional
++
++from agent.model_metadata import fetch_endpoint_model_metadata, fetch_model_metadata
++from utils import base_url_host_matches
++
++DEFAULT_PRICING = {"input": 0.0, "output": 0.0}
++
++_ZERO = Decimal("0")
++_ONE_MILLION = Decimal("1000000")
++_NOUS_DEFAULT_BASE_URL = "https://inference-api.nousresearch.com/v1"
++
++CostStatus = Literal["actual", "estimated", "included", "unknown"]
++CostSource = Literal[
++    "provider_cost_api",
++    "provider_generation_api",
++    "provider_models_api",
++    "official_docs_snapshot",
++    "user_override",
++    "custom_contract",
++    "none",
++]
++
++
++@dataclass(frozen=True)
++class CanonicalUsage:
++    input_tokens: int = 0
++    output_tokens: int = 0
++    cache_read_tokens: int = 0
++    cache_write_tokens: int = 0
++    reasoning_tokens: int = 0
++    request_count: int = 1
++    raw_usage: Optional[dict[str, Any]] = None
++
++    @property
++    def prompt_tokens(self) -> int:
++        return self.input_tokens + self.cache_read_tokens + self.cache_write_tokens
++
++    @property
++    def total_tokens(self) -> int:
++        return self.prompt_tokens + self.output_tokens
++
++
++@dataclass(frozen=True)
++class BillingRoute:
++    provider: str
++    model: str
++    base_url: str = ""
++    billing_mode: str = "unknown"
++
++
++@dataclass(frozen=True)
++class PricingEntry:
++    input_cost_per_million: Optional[Decimal] = None
++    output_cost_per_million: Optional[Decimal] = None
++    cache_read_cost_per_million: Optional[Decimal] = None
++    cache_write_cost_per_million: Optional[Decimal] = None
++    request_cost: Optional[Decimal] = None
 +    currency: str = "USD"
-     source: CostSource = "none"
-     source_url: Optional[str] = None
-     pricing_version: Optional[str] = None
-@@ -72,6 +73,8 @@ class CostResult:
-     status: CostStatus
-     source: CostSource
-     label: str
++    source: CostSource = "none"
++    source_url: Optional[str] = None
++    pricing_version: Optional[str] = None
++    fetched_at: Optional[datetime] = None
++
++
++@dataclass(frozen=True)
++class CostResult:
++    amount_usd: Optional[Decimal]
++    status: CostStatus
++    source: CostSource
++    label: str
 +    currency: str = "USD"
 +    cache_billable: bool = False
-     fetched_at: Optional[datetime] = None
-     pricing_version: Optional[str] = None
-     notes: tuple[str, ...] = ()
-@@ -377,37 +380,86 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
-         source_url="https://platform.claude.com/docs/en/about-claude/pricing",
-         pricing_version="anthropic-pricing-2026-05",
-     ),
--    # DeepSeek
++    fetched_at: Optional[datetime] = None
++    pricing_version: Optional[str] = None
++    notes: tuple[str, ...] = ()
++
++
++_UTC_NOW = lambda: datetime.now(timezone.utc)
++
++
++# Official docs snapshot entries. Models whose published pricing and cache
++# semantics are stable enough to encode exactly.
++_OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
++    # ── Anthropic Claude 4.8 ─────────────────────────────────────────────
++    # Same $5/$25 base pricing as 4.6/4.7.  Fast-mode variant is a separate
++    # model ID with 2x premium (vs the 6x premium on older Opus generations).
++    # Source: https://openrouter.ai/anthropic/claude-opus-4.8
++    (
++        "anthropic",
++        "claude-opus-4-8",
++    ): PricingEntry(
++        input_cost_per_million=Decimal("5.00"),
++        output_cost_per_million=Decimal("25.00"),
++        cache_read_cost_per_million=Decimal("0.50"),
++        cache_write_cost_per_million=Decimal("6.25"),
++        source="official_docs_snapshot",
++        source_url="https://platform.claude.com/docs/en/about-claude/pricing",
++        pricing_version="anthropic-pricing-2026-05",
++    ),
++    (
++        "anthropic",
++        "claude-opus-4-8-fast",
++    ): PricingEntry(
++        input_cost_per_million=Decimal("10.00"),
++        output_cost_per_million=Decimal("50.00"),
++        cache_read_cost_per_million=Decimal("1.00"),
++        cache_write_cost_per_million=Decimal("12.50"),
++        source="official_docs_snapshot",
++        source_url="https://openrouter.ai/anthropic/claude-opus-4.8-fast",
++        pricing_version="anthropic-pricing-2026-05",
++    ),
++    # ── Anthropic Claude 4.7 ─────────────────────────────────────────────
++    # Opus 4.5/4.6/4.7 share $5/$25 pricing (new tokenizer, up to 35% more
++    # tokens for the same text).
++    # Source: https://platform.claude.com/docs/en/about-claude/pricing
++    (
++        "anthropic",
++        "claude-opus-4-7",
++    ): PricingEntry(
++        input_cost_per_million=Decimal("5.00"),
++        output_cost_per_million=Decimal("25.00"),
++        cache_read_cost_per_million=Decimal("0.50"),
++        cache_write_cost_per_million=Decimal("6.25"),
++        source="official_docs_snapshot",
++        source_url="https://platform.claude.com/docs/en/about-claude/pricing",
++        pricing_version="anthropic-pricing-2026-05",
++    ),
++    (
++        "anthropic",
++        "claude-opus-4-7-20250507",
++    ): PricingEntry(
++        input_cost_per_million=Decimal("5.00"),
++        output_cost_per_million=Decimal("25.00"),
++        cache_read_cost_per_million=Decimal("0.50"),
++        cache_write_cost_per_million=Decimal("6.25"),
++        source="official_docs_snapshot",
++        source_url="https://platform.claude.com/docs/en/about-claude/pricing",
++        pricing_version="anthropic-pricing-2026-05",
++    ),
++    # ── Anthropic Claude 4.6 ─────────────────────────────────────────────
++    (
++        "anthropic",
++        "claude-opus-4-6",
++    ): PricingEntry(
++        input_cost_per_million=Decimal("5.00"),
++        output_cost_per_million=Decimal("25.00"),
++        cache_read_cost_per_million=Decimal("0.50"),
++        cache_write_cost_per_million=Decimal("6.25"),
++        source="official_docs_snapshot",
++        source_url="https://platform.claude.com/docs/en/about-claude/pricing",
++        pricing_version="anthropic-pricing-2026-05",
++    ),
++    (
++        "anthropic",
++        "claude-opus-4-6-20250414",
++    ): PricingEntry(
++        input_cost_per_million=Decimal("5.00"),
++        output_cost_per_million=Decimal("25.00"),
++        cache_read_cost_per_million=Decimal("0.50"),
++        cache_write_cost_per_million=Decimal("6.25"),
++        source="official_docs_snapshot",
++        source_url="https://platform.claude.com/docs/en/about-claude/pricing",
++        pricing_version="anthropic-pricing-2026-05",
++    ),
++    (
++        "anthropic",
++        "claude-sonnet-4-6",
++    ): PricingEntry(
++        input_cost_per_million=Decimal("3.00"),
++        output_cost_per_million=Decimal("15.00"),
++        cache_read_cost_per_million=Decimal("0.30"),
++        cache_write_cost_per_million=Decimal("3.75"),
++        source="official_docs_snapshot",
++        source_url="https://platform.claude.com/docs/en/about-claude/pricing",
++        pricing_version="anthropic-pricing-2026-05",
++    ),
++    (
++        "anthropic",
++        "claude-sonnet-4-6-20250414",
++    ): PricingEntry(
++        input_cost_per_million=Decimal("3.00"),
++        output_cost_per_million=Decimal("15.00"),
++        cache_read_cost_per_million=Decimal("0.30"),
++        cache_write_cost_per_million=Decimal("3.75"),
++        source="official_docs_snapshot",
++        source_url="https://platform.claude.com/docs/en/about-claude/pricing",
++        pricing_version="anthropic-pricing-2026-05",
++    ),
++    # ── Anthropic Claude 4.5 ─────────────────────────────────────────────
++    (
++        "anthropic",
++        "claude-opus-4-5",
++    ): PricingEntry(
++        input_cost_per_million=Decimal("5.00"),
++        output_cost_per_million=Decimal("25.00"),
++        cache_read_cost_per_million=Decimal("0.50"),
++        cache_write_cost_per_million=Decimal("6.25"),
++        source="official_docs_snapshot",
++        source_url="https://platform.claude.com/docs/en/about-claude/pricing",
++        pricing_version="anthropic-pricing-2026-05",
++    ),
++    (
++        "anthropic",
++        "claude-sonnet-4-5",
++    ): PricingEntry(
++        input_cost_per_million=Decimal("3.00"),
++        output_cost_per_million=Decimal("15.00"),
++        cache_read_cost_per_million=Decimal("0.30"),
++        cache_write_cost_per_million=Decimal("3.75"),
++        source="official_docs_snapshot",
++        source_url="https://platform.claude.com/docs/en/about-claude/pricing",
++        pricing_version="anthropic-pricing-2026-05",
++    ),
++    (
++        "anthropic",
++        "claude-haiku-4-5",
++    ): PricingEntry(
++        input_cost_per_million=Decimal("1.00"),
++        output_cost_per_million=Decimal("5.00"),
++        cache_read_cost_per_million=Decimal("0.10"),
++        cache_write_cost_per_million=Decimal("1.25"),
++        source="official_docs_snapshot",
++        source_url="https://platform.claude.com/docs/en/about-claude/pricing",
++        pricing_version="anthropic-pricing-2026-05",
++    ),
++    # ── Anthropic Claude 4 / 4.1 ─────────────────────────────────────────
++    (
++        "anthropic",
++        "claude-opus-4-20250514",
++    ): PricingEntry(
++        input_cost_per_million=Decimal("15.00"),
++        output_cost_per_million=Decimal("75.00"),
++        cache_read_cost_per_million=Decimal("1.50"),
++        cache_write_cost_per_million=Decimal("18.75"),
++        source="official_docs_snapshot",
++        source_url="https://platform.claude.com/docs/en/about-claude/pricing",
++        pricing_version="anthropic-pricing-2026-05",
++    ),
++    (
++        "anthropic",
++        "claude-sonnet-4-20250514",
++    ): PricingEntry(
++        input_cost_per_million=Decimal("3.00"),
++        output_cost_per_million=Decimal("15.00"),
++        cache_read_cost_per_million=Decimal("0.30"),
++        cache_write_cost_per_million=Decimal("3.75"),
++        source="official_docs_snapshot",
++        source_url="https://platform.claude.com/docs/en/about-claude/pricing",
++        pricing_version="anthropic-pricing-2026-05",
++    ),
++    # OpenAI
++    (
++        "openai",
++        "gpt-4o",
++    ): PricingEntry(
++        input_cost_per_million=Decimal("2.50"),
++        output_cost_per_million=Decimal("10.00"),
++        cache_read_cost_per_million=Decimal("1.25"),
++        source="official_docs_snapshot",
++        source_url="https://openai.com/api/pricing/",
++        pricing_version="openai-pricing-2026-03-16",
++    ),
++    (
++        "openai",
++        "gpt-4o-mini",
++    ): PricingEntry(
++        input_cost_per_million=Decimal("0.15"),
++        output_cost_per_million=Decimal("0.60"),
++        cache_read_cost_per_million=Decimal("0.075"),
++        source="official_docs_snapshot",
++        source_url="https://openai.com/api/pricing/",
++        pricing_version="openai-pricing-2026-03-16",
++    ),
++    (
++        "openai",
++        "gpt-4.1",
++    ): PricingEntry(
++        input_cost_per_million=Decimal("2.00"),
++        output_cost_per_million=Decimal("8.00"),
++        cache_read_cost_per_million=Decimal("0.50"),
++        source="official_docs_snapshot",
++        source_url="https://openai.com/api/pricing/",
++        pricing_version="openai-pricing-2026-03-16",
++    ),
++    (
++        "openai",
++        "gpt-4.1-mini",
++    ): PricingEntry(
++        input_cost_per_million=Decimal("0.40"),
++        output_cost_per_million=Decimal("1.60"),
++        cache_read_cost_per_million=Decimal("0.10"),
++        source="official_docs_snapshot",
++        source_url="https://openai.com/api/pricing/",
++        pricing_version="openai-pricing-2026-03-16",
++    ),
++    (
++        "openai",
++        "gpt-4.1-nano",
++    ): PricingEntry(
++        input_cost_per_million=Decimal("0.10"),
++        output_cost_per_million=Decimal("0.40"),
++        cache_read_cost_per_million=Decimal("0.025"),
++        source="official_docs_snapshot",
++        source_url="https://openai.com/api/pricing/",
++        pricing_version="openai-pricing-2026-03-16",
++    ),
++    (
++        "openai",
++        "o3",
++    ): PricingEntry(
++        input_cost_per_million=Decimal("10.00"),
++        output_cost_per_million=Decimal("40.00"),
++        cache_read_cost_per_million=Decimal("2.50"),
++        source="official_docs_snapshot",
++        source_url="https://openai.com/api/pricing/",
++        pricing_version="openai-pricing-2026-03-16",
++    ),
++    (
++        "openai",
++        "o3-mini",
++    ): PricingEntry(
++        input_cost_per_million=Decimal("1.10"),
++        output_cost_per_million=Decimal("4.40"),
++        cache_read_cost_per_million=Decimal("0.55"),
++        source="official_docs_snapshot",
++        source_url="https://openai.com/api/pricing/",
++        pricing_version="openai-pricing-2026-03-16",
++    ),
++    # ── Anthropic older models (pre-4.5 generation) ────────────────────────
++    (
++        "anthropic",
++        "claude-3-5-sonnet-20241022",
++    ): PricingEntry(
++        input_cost_per_million=Decimal("3.00"),
++        output_cost_per_million=Decimal("15.00"),
++        cache_read_cost_per_million=Decimal("0.30"),
++        cache_write_cost_per_million=Decimal("3.75"),
++        source="official_docs_snapshot",
++        source_url="https://platform.claude.com/docs/en/about-claude/pricing",
++        pricing_version="anthropic-pricing-2026-05",
++    ),
++    (
++        "anthropic",
++        "claude-3-5-haiku-20241022",
++    ): PricingEntry(
++        input_cost_per_million=Decimal("0.80"),
++        output_cost_per_million=Decimal("4.00"),
++        cache_read_cost_per_million=Decimal("0.08"),
++        cache_write_cost_per_million=Decimal("1.00"),
++        source="official_docs_snapshot",
++        source_url="https://platform.claude.com/docs/en/about-claude/pricing",
++        pricing_version="anthropic-pricing-2026-05",
++    ),
++    (
++        "anthropic",
++        "claude-3-opus-20240229",
++    ): PricingEntry(
++        input_cost_per_million=Decimal("15.00"),
++        output_cost_per_million=Decimal("75.00"),
++        cache_read_cost_per_million=Decimal("1.50"),
++        cache_write_cost_per_million=Decimal("18.75"),
++        source="official_docs_snapshot",
++        source_url="https://platform.claude.com/docs/en/about-claude/pricing",
++        pricing_version="anthropic-pricing-2026-05",
++    ),
++    (
++        "anthropic",
++        "claude-3-haiku-20240307",
++    ): PricingEntry(
++        input_cost_per_million=Decimal("0.25"),
++        output_cost_per_million=Decimal("1.25"),
++        cache_read_cost_per_million=Decimal("0.03"),
++        cache_write_cost_per_million=Decimal("0.30"),
++        source="official_docs_snapshot",
++        source_url="https://platform.claude.com/docs/en/about-claude/pricing",
++        pricing_version="anthropic-pricing-2026-05",
++    ),
 +    # ── DeepSeek (official API, api.deepseek.com) ─────────────────────────
 +    # deepseek-chat and deepseek-reasoner are server-side aliases for
 +    # the non-thinking / thinking modes of deepseek-v4-flash and share
 +    # the same pricing + cache semantics.
 +    # Source: https://api-docs.deepseek.com/quick_start/pricing
 +    # Cache hit price reduced to 1/10 of launch price effective 2026/04/26.
-     (
-         "deepseek",
-         "deepseek-chat",
-     ): PricingEntry(
--        input_cost_per_million=Decimal("0.14"),
--        output_cost_per_million=Decimal("0.28"),
++    (
++        "deepseek",
++        "deepseek-chat",
++    ): PricingEntry(
 +        input_cost_per_million=Decimal("1"),
 +        output_cost_per_million=Decimal("2"),
 +        cache_read_cost_per_million=Decimal("0.02"),
 +        currency="CNY",
-         source="official_docs_snapshot",
-         source_url="https://api-docs.deepseek.com/quick_start/pricing",
--        pricing_version="deepseek-pricing-2026-03-16",
++        source="official_docs_snapshot",
++        source_url="https://api-docs.deepseek.com/quick_start/pricing",
 +        pricing_version="deepseek-pricing-2026-05-29",
-     ),
-     (
-         "deepseek",
-         "deepseek-reasoner",
-     ): PricingEntry(
--        input_cost_per_million=Decimal("0.55"),
--        output_cost_per_million=Decimal("2.19"),
++    ),
++    (
++        "deepseek",
++        "deepseek-reasoner",
++    ): PricingEntry(
 +        input_cost_per_million=Decimal("1"),
 +        output_cost_per_million=Decimal("2"),
 +        cache_read_cost_per_million=Decimal("0.02"),
 +        currency="CNY",
-         source="official_docs_snapshot",
-         source_url="https://api-docs.deepseek.com/quick_start/pricing",
--        pricing_version="deepseek-pricing-2026-03-16",
++        source="official_docs_snapshot",
++        source_url="https://api-docs.deepseek.com/quick_start/pricing",
 +        pricing_version="deepseek-pricing-2026-05-29",
-     ),
-     (
-         "deepseek",
-         "deepseek-v4-pro",
-     ): PricingEntry(
--        input_cost_per_million=Decimal("1.74"),
--        output_cost_per_million=Decimal("3.48"),
--        cache_read_cost_per_million=Decimal("0.0145"),
++    ),
++    (
++        "deepseek",
++        "deepseek-v4-pro",
++    ): PricingEntry(
 +        input_cost_per_million=Decimal("3"),
 +        output_cost_per_million=Decimal("6"),
 +        cache_read_cost_per_million=Decimal("0.025"),
 +        currency="CNY",
-         source="official_docs_snapshot",
-         source_url="https://api-docs.deepseek.com/quick_start/pricing",
--        pricing_version="deepseek-pricing-2026-05-12",
++        source="official_docs_snapshot",
++        source_url="https://api-docs.deepseek.com/quick_start/pricing",
 +        pricing_version="deepseek-pricing-2026-05-29",
 +    ),
 +    (
@@ -358,42 +1705,313 @@ index 8d6b85cd0..5167bc944 100644
 +        source="official_docs_snapshot",
 +        source_url="https://bailian.console.aliyun.com/cn-beijing/?tab=model#/model-market/detail/deepseek-v4-pro",
 +        pricing_version="alibaba-dashscope-pricing-2026-05-29",
-     ),
-     # Google Gemini
-     (
-@@ -576,7 +628,17 @@ def resolve_billing_route(
-         return BillingRoute(provider="openai", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
-     if provider_name in {"minimax", "minimax-cn"}:
-         return BillingRoute(provider=provider_name, model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
++    ),
++    # Google Gemini
++    (
++        "google",
++        "gemini-2.5-pro",
++    ): PricingEntry(
++        input_cost_per_million=Decimal("1.25"),
++        output_cost_per_million=Decimal("10.00"),
++        source="official_docs_snapshot",
++        source_url="https://ai.google.dev/pricing",
++        pricing_version="google-pricing-2026-03-16",
++    ),
++    (
++        "google",
++        "gemini-2.5-flash",
++    ): PricingEntry(
++        input_cost_per_million=Decimal("0.15"),
++        output_cost_per_million=Decimal("0.60"),
++        source="official_docs_snapshot",
++        source_url="https://ai.google.dev/pricing",
++        pricing_version="google-pricing-2026-03-16",
++    ),
++    (
++        "google",
++        "gemini-2.0-flash",
++    ): PricingEntry(
++        input_cost_per_million=Decimal("0.10"),
++        output_cost_per_million=Decimal("0.40"),
++        source="official_docs_snapshot",
++        source_url="https://ai.google.dev/pricing",
++        pricing_version="google-pricing-2026-03-16",
++    ),
++    # AWS Bedrock — pricing per the Bedrock pricing page.
++    # Bedrock charges the same per-token rates as the model provider but
++    # through AWS billing.  These are the on-demand prices (no commitment).
++    # Source: https://aws.amazon.com/bedrock/pricing/
++    (
++        "bedrock",
++        "anthropic.claude-opus-4-6",
++    ): PricingEntry(
++        input_cost_per_million=Decimal("15.00"),
++        output_cost_per_million=Decimal("75.00"),
++        cache_read_cost_per_million=Decimal("1.50"),
++        cache_write_cost_per_million=Decimal("18.75"),
++        source="official_docs_snapshot",
++        source_url="https://aws.amazon.com/bedrock/pricing/",
++        pricing_version="bedrock-pricing-2026-04",
++    ),
++    (
++        "bedrock",
++        "anthropic.claude-sonnet-4-6",
++    ): PricingEntry(
++        input_cost_per_million=Decimal("3.00"),
++        output_cost_per_million=Decimal("15.00"),
++        cache_read_cost_per_million=Decimal("0.30"),
++        cache_write_cost_per_million=Decimal("3.75"),
++        source="official_docs_snapshot",
++        source_url="https://aws.amazon.com/bedrock/pricing/",
++        pricing_version="bedrock-pricing-2026-04",
++    ),
++    (
++        "bedrock",
++        "anthropic.claude-sonnet-4-5",
++    ): PricingEntry(
++        input_cost_per_million=Decimal("3.00"),
++        output_cost_per_million=Decimal("15.00"),
++        cache_read_cost_per_million=Decimal("0.30"),
++        cache_write_cost_per_million=Decimal("3.75"),
++        source="official_docs_snapshot",
++        source_url="https://aws.amazon.com/bedrock/pricing/",
++        pricing_version="bedrock-pricing-2026-04",
++    ),
++    (
++        "bedrock",
++        "anthropic.claude-haiku-4-5",
++    ): PricingEntry(
++        input_cost_per_million=Decimal("0.80"),
++        output_cost_per_million=Decimal("4.00"),
++        cache_read_cost_per_million=Decimal("0.08"),
++        cache_write_cost_per_million=Decimal("1.00"),
++        source="official_docs_snapshot",
++        source_url="https://aws.amazon.com/bedrock/pricing/",
++        pricing_version="bedrock-pricing-2026-04",
++    ),
++    (
++        "bedrock",
++        "amazon.nova-pro",
++    ): PricingEntry(
++        input_cost_per_million=Decimal("0.80"),
++        output_cost_per_million=Decimal("3.20"),
++        source="official_docs_snapshot",
++        source_url="https://aws.amazon.com/bedrock/pricing/",
++        pricing_version="bedrock-pricing-2026-04",
++    ),
++    (
++        "bedrock",
++        "amazon.nova-lite",
++    ): PricingEntry(
++        input_cost_per_million=Decimal("0.06"),
++        output_cost_per_million=Decimal("0.24"),
++        source="official_docs_snapshot",
++        source_url="https://aws.amazon.com/bedrock/pricing/",
++        pricing_version="bedrock-pricing-2026-04",
++    ),
++    (
++        "bedrock",
++        "amazon.nova-micro",
++    ): PricingEntry(
++        input_cost_per_million=Decimal("0.035"),
++        output_cost_per_million=Decimal("0.14"),
++        source="official_docs_snapshot",
++        source_url="https://aws.amazon.com/bedrock/pricing/",
++        pricing_version="bedrock-pricing-2026-04",
++    ),
++    # MiniMax
++    (
++        "minimax",
++        "minimax-m2.7",
++    ): PricingEntry(
++        input_cost_per_million=Decimal("0.30"),
++        output_cost_per_million=Decimal("1.20"),
++        source="official_docs_snapshot",
++        pricing_version="minimax-pricing-2026-04",
++    ),
++    (
++        "minimax-cn",
++        "minimax-m2.7",
++    ): PricingEntry(
++        input_cost_per_million=Decimal("0.30"),
++        output_cost_per_million=Decimal("1.20"),
++        source="official_docs_snapshot",
++        pricing_version="minimax-pricing-2026-04",
++    ),
++}
++
++
++def _to_decimal(value: Any) -> Optional[Decimal]:
++    if value is None:
++        return None
++    try:
++        return Decimal(str(value))
++    except Exception:
++        return None
++
++
++def _to_int(value: Any) -> int:
++    try:
++        return int(value or 0)
++    except Exception:
++        return 0
++
++
++def resolve_billing_route(
++    model_name: str,
++    provider: Optional[str] = None,
++    base_url: Optional[str] = None,
++) -> BillingRoute:
++    provider_name = (provider or "").strip().lower()
++    base = (base_url or "").strip().lower()
++    model = (model_name or "").strip()
++    if not provider_name and "/" in model:
++        inferred_provider, bare_model = model.split("/", 1)
++        if inferred_provider in {"anthropic", "openai", "google"}:
++            provider_name = inferred_provider
++            model = bare_model
++
++    if provider_name == "openai-codex":
++        return BillingRoute(provider="openai-codex", model=model, base_url=base_url or "", billing_mode="subscription_included")
++    if provider_name == "openrouter" or base_url_host_matches(base_url or "", "openrouter.ai"):
++        return BillingRoute(provider="openrouter", model=model, base_url=base_url or "", billing_mode="official_models_api")
++    if provider_name == "nous" or base_url_host_matches(base_url or "", "inference-api.nousresearch.com"):
++        return BillingRoute(provider="nous", model=model, base_url=base_url or _NOUS_DEFAULT_BASE_URL, billing_mode="official_models_api")
++    if provider_name == "anthropic":
++        return BillingRoute(provider="anthropic", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
++    if provider_name == "openai":
++        return BillingRoute(provider="openai", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
++    if provider_name in {"minimax", "minimax-cn"}:
++        return BillingRoute(provider=provider_name, model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
 +    # ── Alibaba Cloud Model Studio (DashScope) ─────────────────────
 +    if provider_name in {"alibaba", "dashscope", "aliyun"}:
 +        # Alibaba has its own per-model CNY pricing entries in
 +        # _OFFICIAL_DOCS_PRICING (keyed by "alibaba" provider).
 +        return BillingRoute(provider="alibaba", model=model.split("/")[-1] if model else "", base_url=base_url or "", billing_mode="official_docs_snapshot")
-     if provider_name in {"custom", "local"} or (base and "localhost" in base):
++    if provider_name in {"custom", "local"} or (base and "localhost" in base):
 +        # DashScope / Alibaba Cloud hosts both DeepSeek and its own models.
 +        # Route DeepSeek models via Alibaba so cache pricing is correct
 +        # (Alibaba charges ¥0.2/M for v4-flash cache, not DeepSeek's ¥0.02).
 +        if base and ("dashscope" in base or "aliyun" in base) and model.startswith("deepseek"):
 +            return BillingRoute(provider="alibaba", model=model.split("/")[-1] if model else "", base_url=base_url or "", billing_mode="official_docs_snapshot")
-         return BillingRoute(provider=provider_name or "custom", model=model, base_url=base_url or "", billing_mode="unknown")
-     return BillingRoute(provider=provider_name or "unknown", model=model.split("/")[-1] if model else "", base_url=base_url or "", billing_mode="unknown")
- 
-@@ -609,8 +671,8 @@ def _lookup_official_docs_pricing(route: BillingRoute) -> Optional[PricingEntry]
-         normalized = _normalize_anthropic_model_name(model)
-         if normalized != model:
-             entry = _OFFICIAL_DOCS_PRICING.get((route.provider, normalized))
--            if entry:
--                return entry
-+        if entry:
-+            return entry
-     return None
- 
- 
-@@ -667,6 +729,73 @@ def _pricing_entry_from_metadata(
-     )
- 
- 
++        return BillingRoute(provider=provider_name or "custom", model=model, base_url=base_url or "", billing_mode="unknown")
++    return BillingRoute(provider=provider_name or "unknown", model=model.split("/")[-1] if model else "", base_url=base_url or "", billing_mode="unknown")
++
++
++def _normalize_bedrock_model_name(model: str) -> str:
++    """Normalize a Bedrock model id to its bare foundation-model form.
++
++    Bedrock cross-region inference profiles prefix the foundation model id
++    with a region scope (``us.`` / ``global.`` / ``eu.`` / ``ap.`` / ``jp.``),
++    e.g. ``us.anthropic.claude-opus-4-7``.  The pricing table is keyed on the
++    bare ``anthropic.claude-*`` id, so the prefix must be stripped before the
++    lookup or every cross-region session prices as unknown.  Mirrors the
++    prefix list in ``bedrock_adapter.is_anthropic_bedrock_model``.  Also
++    normalizes dot-notation version numbers (``4.7`` → ``4-7``).
++    """
++    name = model.lower().strip()
++    for prefix in ("us.", "global.", "eu.", "ap.", "jp."):
++        if name.startswith(prefix):
++            name = name[len(prefix):]
++            break
++    name = re.sub(r"(\d+)\.(\d+)", r"\1-\2", name)
++    return name
++
++
++def _normalize_anthropic_model_name(model: str) -> str:
++    """Normalize Anthropic model name variants to canonical form.
++
++    Handles:
++      - Dot notation: claude-opus-4.7 → claude-opus-4-7
++      - Short aliases: claude-opus-4.7 → claude-opus-4-7
++      - Strips anthropic/ prefix if present
++    """
++    name = model.lower().strip()
++    if name.startswith("anthropic/"):
++        name = name[len("anthropic/"):]
++    # Normalize dots to dashes in version numbers (e.g. 4.7 → 4-7, 4.6 → 4-6)
++    # But preserve the rest of the name structure
++    name = re.sub(r"(\d+)\.(\d+)", r"\1-\2", name)
++    return name
++
++
++def _lookup_official_docs_pricing(route: BillingRoute) -> Optional[PricingEntry]:
++    model = route.model.lower()
++    # Direct lookup first
++    entry = _OFFICIAL_DOCS_PRICING.get((route.provider, model))
++    if entry:
++        return entry
++    # Try normalized name for Anthropic (handles dot-notation like opus-4.7)
++    if route.provider == "anthropic":
++        normalized = _normalize_anthropic_model_name(model)
++        if normalized != model:
++            entry = _OFFICIAL_DOCS_PRICING.get((route.provider, normalized))
++            if entry:
++                return entry
++    # Bedrock cross-region inference profiles carry a region prefix
++    # (us./global./eu./...) that the bare pricing keys don't have.
++    if route.provider == "bedrock":
++        normalized = _normalize_bedrock_model_name(model)
++        if normalized != model:
++            entry = _OFFICIAL_DOCS_PRICING.get((route.provider, normalized))
++            if entry:
++                return entry
++    return None
++
++
++def _openrouter_pricing_entry(route: BillingRoute) -> Optional[PricingEntry]:
++    return _pricing_entry_from_metadata(
++        fetch_model_metadata(),
++        route.model,
++        source_url="https://openrouter.ai/docs/api/api-reference/models/get-models",
++        pricing_version="openrouter-models-api",
++    )
++
++
++def _pricing_entry_from_metadata(
++    metadata: Dict[str, Dict[str, Any]],
++    model_id: str,
++    *,
++    source_url: str,
++    pricing_version: str,
++) -> Optional[PricingEntry]:
++    if model_id not in metadata:
++        return None
++    pricing = metadata[model_id].get("pricing") or {}
++    prompt = _to_decimal(pricing.get("prompt"))
++    completion = _to_decimal(pricing.get("completion"))
++    request = _to_decimal(pricing.get("request"))
++    cache_read = _to_decimal(
++        pricing.get("cache_read")
++        or pricing.get("cached_prompt")
++        or pricing.get("input_cache_read")
++    )
++    cache_write = _to_decimal(
++        pricing.get("cache_write")
++        or pricing.get("cache_creation")
++        or pricing.get("input_cache_write")
++    )
++    if prompt is None and completion is None and request is None:
++        return None
++
++    def _per_token_to_per_million(value: Optional[Decimal]) -> Optional[Decimal]:
++        if value is None:
++            return None
++        return value * _ONE_MILLION
++
++    return PricingEntry(
++        input_cost_per_million=_per_token_to_per_million(prompt),
++        output_cost_per_million=_per_token_to_per_million(completion),
++        cache_read_cost_per_million=_per_token_to_per_million(cache_read),
++        cache_write_cost_per_million=_per_token_to_per_million(cache_write),
++        request_cost=request,
++        source="provider_models_api",
++        source_url=source_url,
++        pricing_version=pricing_version,
++        fetched_at=_UTC_NOW(),
++    )
++
++
 +def _load_custom_pricing() -> Dict[str, PricingEntry]:
 +    """Load user-defined model pricing from config.
 +
@@ -461,13 +2079,22 @@ index 8d6b85cd0..5167bc944 100644
 +        return {}
 +
 +
- def get_pricing_entry(
-     model_name: str,
-     provider: Optional[str] = None,
-@@ -683,6 +812,22 @@ def get_pricing_entry(
-             source="none",
-             pricing_version="included-route",
-         )
++def get_pricing_entry(
++    model_name: str,
++    provider: Optional[str] = None,
++    base_url: Optional[str] = None,
++    api_key: Optional[str] = None,
++) -> Optional[PricingEntry]:
++    route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
++    if route.billing_mode == "subscription_included":
++        return PricingEntry(
++            input_cost_per_million=_ZERO,
++            output_cost_per_million=_ZERO,
++            cache_read_cost_per_million=_ZERO,
++            cache_write_cost_per_million=_ZERO,
++            source="none",
++            pricing_version="included-route",
++        )
 +
 +    # User-configured pricing in config.yaml[custom_pricing] takes
 +    # priority over all other sources.  Match order:
@@ -484,64 +2111,287 @@ index 8d6b85cd0..5167bc944 100644
 +        if model_name in custom:
 +            return custom[model_name]
 +
-     if route.provider == "openrouter":
-         return _openrouter_pricing_entry(route)
-     if route.base_url:
-@@ -747,6 +892,10 @@ def normalize_usage(
-         cache_read_tokens = _to_int(getattr(details, "cached_tokens", 0) if details else 0)
-         if not cache_read_tokens:
-             cache_read_tokens = _to_int(getattr(response_usage, "cache_read_input_tokens", 0))
++    if route.provider == "openrouter":
++        return _openrouter_pricing_entry(route)
++    if route.base_url:
++        entry = _pricing_entry_from_metadata(
++            fetch_endpoint_model_metadata(route.base_url, api_key=api_key or ""),
++            route.model,
++            source_url=f"{route.base_url.rstrip('/')}/models",
++            pricing_version="openai-compatible-models-api",
++        )
++        if entry:
++            return entry
++    return _lookup_official_docs_pricing(route)
++
++
++def normalize_usage(
++    response_usage: Any,
++    *,
++    provider: Optional[str] = None,
++    api_mode: Optional[str] = None,
++) -> CanonicalUsage:
++    """Normalize raw API response usage into canonical token buckets.
++
++    Handles three API shapes:
++    - Anthropic: input_tokens/output_tokens/cache_read_input_tokens/cache_creation_input_tokens
++    - Codex Responses: input_tokens includes cache tokens; input_tokens_details.cached_tokens separates them
++    - OpenAI Chat Completions: prompt_tokens includes cache tokens; prompt_tokens_details.cached_tokens separates them
++
++    In both Codex and OpenAI modes, input_tokens is derived by subtracting cache
++    tokens from the total — the API contract is that input/prompt totals include
++    cached tokens and the details object breaks them out.
++    """
++    if not response_usage:
++        return CanonicalUsage()
++
++    provider_name = (provider or "").strip().lower()
++    mode = (api_mode or "").strip().lower()
++
++    if mode == "anthropic_messages" or provider_name == "anthropic":
++        input_tokens = _to_int(getattr(response_usage, "input_tokens", 0))
++        output_tokens = _to_int(getattr(response_usage, "output_tokens", 0))
++        cache_read_tokens = _to_int(getattr(response_usage, "cache_read_input_tokens", 0))
++        cache_write_tokens = _to_int(getattr(response_usage, "cache_creation_input_tokens", 0))
++    elif mode == "codex_responses":
++        input_total = _to_int(getattr(response_usage, "input_tokens", 0))
++        output_tokens = _to_int(getattr(response_usage, "output_tokens", 0))
++        details = getattr(response_usage, "input_tokens_details", None)
++        cache_read_tokens = _to_int(getattr(details, "cached_tokens", 0) if details else 0)
++        cache_write_tokens = _to_int(
++            getattr(details, "cache_creation_tokens", 0) if details else 0
++        )
++        input_tokens = max(0, input_total - cache_read_tokens - cache_write_tokens)
++    else:
++        prompt_total = _to_int(getattr(response_usage, "prompt_tokens", 0))
++        output_tokens = _to_int(getattr(response_usage, "completion_tokens", 0))
++        details = getattr(response_usage, "prompt_tokens_details", None)
++        # Primary: OpenAI-style prompt_tokens_details. Fallback: Anthropic-style
++        # top-level fields that some OpenAI-compatible proxies (OpenRouter, Cline)
++        # expose when routing Claude models — without this
++        # fallback, cache writes are undercounted as 0 and cache reads can be
++        # missed when the proxy only surfaces them at the top level.
++        # Port of cline/cline#10266.
++        cache_read_tokens = _to_int(getattr(details, "cached_tokens", 0) if details else 0)
++        if not cache_read_tokens:
++            cache_read_tokens = _to_int(getattr(response_usage, "cache_read_input_tokens", 0))
 +        if not cache_read_tokens:
 +            # DeepSeek-specific custom fields: prompt_cache_hit_tokens (returned
 +            # alongside prompt_cache_miss_tokens as the cache hit breakdown)
 +            cache_read_tokens = _to_int(getattr(response_usage, "prompt_cache_hit_tokens", 0))
-         cache_write_tokens = _to_int(
-             getattr(details, "cache_write_tokens", 0) if details else 0
-         )
-@@ -818,6 +967,12 @@ def estimate_usage_cost(
-                 notes=("cache-write pricing unavailable for route",),
-             )
- 
++        cache_write_tokens = _to_int(
++            getattr(details, "cache_write_tokens", 0) if details else 0
++        )
++        if not cache_write_tokens:
++            cache_write_tokens = _to_int(
++                getattr(response_usage, "cache_creation_input_tokens", 0)
++            )
++        input_tokens = max(0, prompt_total - cache_read_tokens - cache_write_tokens)
++
++    reasoning_tokens = 0
++    output_details = getattr(response_usage, "output_tokens_details", None)
++    if output_details:
++        reasoning_tokens = _to_int(getattr(output_details, "reasoning_tokens", 0))
++
++    return CanonicalUsage(
++        input_tokens=input_tokens,
++        output_tokens=output_tokens,
++        cache_read_tokens=cache_read_tokens,
++        cache_write_tokens=cache_write_tokens,
++        reasoning_tokens=reasoning_tokens,
++    )
++
++
++def estimate_usage_cost(
++    model_name: str,
++    usage: CanonicalUsage,
++    *,
++    provider: Optional[str] = None,
++    base_url: Optional[str] = None,
++    api_key: Optional[str] = None,
++) -> CostResult:
++    route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
++    if route.billing_mode == "subscription_included":
++        return CostResult(
++            amount_usd=_ZERO,
++            status="included",
++            source="none",
++            label="included",
++            pricing_version="included-route",
++        )
++
++    entry = get_pricing_entry(model_name, provider=provider, base_url=base_url, api_key=api_key)
++    if not entry:
++        return CostResult(amount_usd=None, status="unknown", source="none", label="n/a")
++
++    notes: list[str] = []
++    amount = _ZERO
++
++    if usage.input_tokens and entry.input_cost_per_million is None:
++        return CostResult(amount_usd=None, status="unknown", source=entry.source, label="n/a")
++    if usage.output_tokens and entry.output_cost_per_million is None:
++        return CostResult(amount_usd=None, status="unknown", source=entry.source, label="n/a")
++    if usage.cache_read_tokens:
++        if entry.cache_read_cost_per_million is None:
++            return CostResult(
++                amount_usd=None,
++                status="unknown",
++                source=entry.source,
++                label="n/a",
++                notes=("cache-read pricing unavailable for route",),
++            )
++    if usage.cache_write_tokens:
++        if entry.cache_write_cost_per_million is None:
++            return CostResult(
++                amount_usd=None,
++                status="unknown",
++                source=entry.source,
++                label="n/a",
++                notes=("cache-write pricing unavailable for route",),
++            )
++
 +    # Price of 0 means "free" — don't show cost or cache for this model
 +    if entry.input_cost_per_million == _ZERO:
 +        return CostResult(amount_usd=None, status="unknown", source=entry.source, label="n/a")
 +    if entry.output_cost_per_million == _ZERO:
 +        return CostResult(amount_usd=None, status="unknown", source=entry.source, label="n/a")
 +
-     if entry.input_cost_per_million is not None:
-         amount += Decimal(usage.input_tokens) * entry.input_cost_per_million / _ONE_MILLION
-     if entry.output_cost_per_million is not None:
-@@ -830,7 +985,8 @@ def estimate_usage_cost(
-         amount += Decimal(usage.request_count) * entry.request_cost
- 
-     status: CostStatus = "estimated"
--    label = f"~${amount:.2f}"
++    if entry.input_cost_per_million is not None:
++        amount += Decimal(usage.input_tokens) * entry.input_cost_per_million / _ONE_MILLION
++    if entry.output_cost_per_million is not None:
++        amount += Decimal(usage.output_tokens) * entry.output_cost_per_million / _ONE_MILLION
++    if entry.cache_read_cost_per_million is not None:
++        amount += Decimal(usage.cache_read_tokens) * entry.cache_read_cost_per_million / _ONE_MILLION
++    if entry.cache_write_cost_per_million is not None:
++        amount += Decimal(usage.cache_write_tokens) * entry.cache_write_cost_per_million / _ONE_MILLION
++    if entry.request_cost is not None and usage.request_count:
++        amount += Decimal(usage.request_count) * entry.request_cost
++
++    status: CostStatus = "estimated"
 +    currency_symbol = "¥" if entry.currency == "CNY" else "$"
 +    label = f"~{currency_symbol}{amount:.2f}"
-     if entry.source == "none" and amount == _ZERO:
-         status = "included"
-         label = "included"
-@@ -843,6 +999,8 @@ def estimate_usage_cost(
-         status=status,
-         source=entry.source,
-         label=label,
++    if entry.source == "none" and amount == _ZERO:
++        status = "included"
++        label = "included"
++
++    if route.provider == "openrouter":
++        notes.append("OpenRouter cost is estimated from the models API until reconciled.")
++
++    return CostResult(
++        amount_usd=amount,
++        status=status,
++        source=entry.source,
++        label=label,
 +        currency=entry.currency,
 +        cache_billable=entry.cache_read_cost_per_million is not None and entry.cache_read_cost_per_million > _ZERO,
-         fetched_at=entry.fetched_at,
-         pricing_version=entry.pricing_version,
-         notes=tuple(notes),
-@@ -902,4 +1060,4 @@ def format_token_count_compact(value: int) -> str:
-                 text = text.rstrip("0").rstrip(".")
-             return f"{sign}{text}{suffix}"
- 
--    return f"{value:,}"
++        fetched_at=entry.fetched_at,
++        pricing_version=entry.pricing_version,
++        notes=tuple(notes),
++    )
++
++
++def has_known_pricing(
++    model_name: str,
++    provider: Optional[str] = None,
++    base_url: Optional[str] = None,
++    api_key: Optional[str] = None,
++) -> bool:
++    """Check whether we have pricing data for this model+route.
++
++    Uses direct lookup instead of routing through the full estimation
++    pipeline — avoids creating dummy usage objects just to check status.
++    """
++    route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
++    if route.billing_mode == "subscription_included":
++        return True
++    entry = get_pricing_entry(model_name, provider=provider, base_url=base_url, api_key=api_key)
++    return entry is not None
++
++
++
++def format_duration_compact(seconds: float) -> str:
++    if seconds < 60:
++        return f"{seconds:.0f}s"
++    minutes = seconds / 60
++    if minutes < 60:
++        return f"{minutes:.0f}m"
++    hours = minutes / 60
++    if hours < 24:
++        remaining_min = int(minutes % 60)
++        return f"{int(hours)}h {remaining_min}m" if remaining_min else f"{int(hours)}h"
++    days = hours / 24
++    return f"{days:.1f}d"
++
++
++def format_token_count_compact(value: int) -> str:
++    abs_value = abs(int(value))
++    if abs_value < 1_000:
++        return str(int(value))
++
++    sign = "-" if value < 0 else ""
++    units = ((1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K"))
++    for threshold, suffix in units:
++        if abs_value >= threshold:
++            scaled = abs_value / threshold
++            if scaled < 10:
++                text = f"{scaled:.2f}"
++            elif scaled < 100:
++                text = f"{scaled:.1f}"
++            else:
++                text = f"{scaled:.0f}"
++            if "." in text:
++                text = text.rstrip("0").rstrip(".")
++            return f"{sign}{text}{suffix}"
++
 +    return f"{value:,}"
 \ No newline at end of file
 diff --git a/cli.py b/cli.py
-index 000778b75..65b380bee 100644
+index ad0a5050a..8230e36e0 100644
 --- a/cli.py
 +++ b/cli.py
-@@ -3708,6 +3708,8 @@ class HermesCLI:
+@@ -3377,21 +3377,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
+         checkpoints: bool = False,
+         pass_session_id: bool = False,
+         ignore_rules: bool = False,
+-    ):
++        simple_mode: bool = False,
++        ):
+         """
+         Initialize the Hermes CLI.
+ 
+         Args:
+-            model: Model to use (default: from env or claude-sonnet)
+-            toolsets: List of toolsets to enable (default: all)
+-            provider: Inference provider ("auto", "openrouter", "nous", "openai-codex", "zai", "kimi-coding", "minimax", "minimax-cn")
+-            api_key: API key (default: from environment)
+-            base_url: API base URL (default: OpenRouter)
+-            max_turns: Maximum tool-calling iterations shared with subagents (default: 90)
+-            verbose: Enable verbose logging
+-            compact: Use compact display mode
+-            resume: Session ID to resume (restores conversation history from SQLite)
+-            pass_session_id: Include the session ID in the agent's system prompt
++        model: Model to use (default: from env or claude-sonnet)
++        toolsets: List of toolsets to enable (default: all)
++        provider: Inference provider ("auto", "openrouter", "nous", "openai-codex", "zai", "kimi-coding", "minimax", "minimax-cn")
++        api_key: API key (default: from environment)
++        base_url: API base URL (default: OpenRouter)
++        max_turns: Maximum tool-calling iterations shared with subagents (default: 90)
++        verbose: Enable verbose logging
++        compact: Use compact display mode
++        resume: Session ID to resume (restores conversation history from SQLite)
++        pass_session_id: Include the session ID in the agent's system prompt
+         """
+         # Initialize Rich console
+         self.console = Console()
+@@ -3583,6 +3584,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
+         # pass skip_context_files=True and skip_memory=True to AIAgent so
+         # AGENTS.md/SOUL.md/.cursorrules and persistent memory are not loaded.
+         self.ignore_rules = ignore_rules or os.environ.get("HERMES_IGNORE_RULES") == "1"
++        self.simple_mode = simple_mode or CLI_CONFIG["agent"].get("simple_mode", False)
+         
+         # Ephemeral system prompt: env var takes precedence, then config
+         self.system_prompt = (
+@@ -4219,6 +4221,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
              "session_completion_tokens": 0,
              "session_total_tokens": 0,
              "session_api_calls": 0,
@@ -550,7 +2400,7 @@ index 000778b75..65b380bee 100644
              "compressions": 0,
              "active_background_tasks": 0,
              "active_background_processes": 0,
-@@ -3744,6 +3746,42 @@ class HermesCLI:
+@@ -4255,6 +4259,42 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
          snapshot["session_total_tokens"] = getattr(agent, "session_total_tokens", 0) or 0
          snapshot["session_api_calls"] = getattr(agent, "session_api_calls", 0) or 0
  
@@ -593,7 +2443,7 @@ index 000778b75..65b380bee 100644
          compressor = getattr(agent, "context_compressor", None)
          if compressor:
              # last_prompt_tokens is parked at the -1 sentinel right after a
-@@ -3962,7 +4000,6 @@ class HermesCLI:
+@@ -4473,7 +4513,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
              if width is None:
                  width = self._get_tui_terminal_width()
              percent = snapshot["context_percent"]
@@ -601,7 +2451,7 @@ index 000778b75..65b380bee 100644
              duration_label = snapshot["duration"]
  
              yolo_active = self._is_session_yolo_active()
-@@ -3972,7 +4009,7 @@ class HermesCLI:
+@@ -4483,7 +4522,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                      text += " · ⚠ YOLO"
                  return self._trim_status_bar_text(text, width)
              if width < 76:
@@ -610,7 +2460,7 @@ index 000778b75..65b380bee 100644
                  compressions = snapshot.get("compressions", 0)
                  if compressions:
                      parts.append(f"🗜️ {compressions}")
-@@ -3982,6 +4019,16 @@ class HermesCLI:
+@@ -4493,6 +4532,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                  bg_proc_count = snapshot.get("active_background_processes", 0)
                  if bg_proc_count:
                      parts.append(f"⚙ {bg_proc_count}")
@@ -627,7 +2477,7 @@ index 000778b75..65b380bee 100644
                  parts.append(duration_label)
                  if yolo_active:
                      parts.append("⚠ YOLO")
-@@ -3995,7 +4042,7 @@ class HermesCLI:
+@@ -4506,7 +4555,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                  context_label = "ctx --"
  
              compressions = snapshot.get("compressions", 0)
@@ -636,7 +2486,7 @@ index 000778b75..65b380bee 100644
              if compressions:
                  parts.append(f"🗜️ {compressions}")
              bg_count = snapshot.get("active_background_tasks", 0)
-@@ -4004,6 +4051,16 @@ class HermesCLI:
+@@ -4515,6 +4564,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
              bg_proc_count = snapshot.get("active_background_processes", 0)
              if bg_proc_count:
                  parts.append(f"⚙ {bg_proc_count}")
@@ -653,7 +2503,7 @@ index 000778b75..65b380bee 100644
              parts.append(duration_label)
              prompt_elapsed = snapshot.get("prompt_elapsed")
              if prompt_elapsed:
-@@ -4041,7 +4098,6 @@ class HermesCLI:
+@@ -4555,7 +4614,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                  frags.append(("class:status-bar", " "))
              else:
                  percent = snapshot["context_percent"]
@@ -661,7 +2511,7 @@ index 000778b75..65b380bee 100644
                  if width < 76:
                      compressions = snapshot.get("compressions", 0)
                      bg_count = snapshot.get("active_background_tasks", 0)
-@@ -4050,7 +4106,7 @@ class HermesCLI:
+@@ -4564,7 +4622,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                          ("class:status-bar", " ⚕ "),
                          ("class:status-bar-strong", snapshot["model_short"]),
                          ("class:status-bar-dim", " · "),
@@ -670,7 +2520,7 @@ index 000778b75..65b380bee 100644
                      ]
                      if compressions:
                          frags.append(("class:status-bar-dim", " · "))
-@@ -4061,6 +4117,18 @@ class HermesCLI:
+@@ -4575,6 +4633,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                      if bg_proc_count:
                          frags.append(("class:status-bar-dim", " · "))
                          frags.append(("class:status-bar-strong", f"⚙ {bg_proc_count}"))
@@ -689,7 +2539,7 @@ index 000778b75..65b380bee 100644
                      frags.extend([
                          ("class:status-bar-dim", " · "),
                          ("class:status-bar-dim", duration_label),
-@@ -4071,7 +4139,6 @@ class HermesCLI:
+@@ -4585,7 +4655,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                      frags.append(("class:status-bar", " "))
                  else:
                      if snapshot["context_length"]:
@@ -697,7 +2547,7 @@ index 000778b75..65b380bee 100644
                          ctx_used = format_token_count_compact(snapshot["context_tokens"])
                          context_label = f"{ctx_used}/{ctx_total}"
                      else:
-@@ -4089,7 +4156,7 @@ class HermesCLI:
+@@ -4603,7 +4672,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                          ("class:status-bar-dim", " │ "),
                          (bar_style, self._build_context_bar(percent)),
                          ("class:status-bar-dim", " "),
@@ -706,7 +2556,7 @@ index 000778b75..65b380bee 100644
                      ]
                      if compressions:
                          frags.append(("class:status-bar-dim", " │ "))
-@@ -4100,6 +4167,17 @@ class HermesCLI:
+@@ -4614,6 +4683,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                      if bg_proc_count:
                          frags.append(("class:status-bar-dim", " │ "))
                          frags.append(("class:status-bar-strong", f"⚙ {bg_proc_count}"))
@@ -724,7 +2574,7 @@ index 000778b75..65b380bee 100644
                      frags.extend([
                          ("class:status-bar-dim", " │ "),
                          ("class:status-bar-dim", duration_label),
-@@ -10669,7 +10747,7 @@ class HermesCLI:
+@@ -8840,7 +8920,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
          print(f"  Cost source:              {cost_result.source:>10}")
          if cost_result.amount_usd is not None:
              prefix = "~" if cost_result.status == "estimated" else ""
@@ -733,25 +2583,147 @@ index 000778b75..65b380bee 100644
          elif cost_result.status == "included":
              print(f"  Total cost:              {'included':>10}")
          else:
+@@ -14707,6 +14787,7 @@ def main(
+     pass_session_id: bool = False,
+     ignore_user_config: bool = False,
+     ignore_rules: bool = False,
++    simple_mode: bool = False,
+ ):
+     """
+     Hermes Agent CLI - Interactive AI Assistant
+@@ -14830,18 +14911,19 @@ def main(
+ 
+     # Create CLI instance
+     cli = HermesCLI(
+-        model=model,
+-        toolsets=toolsets_list,
+-        provider=provider,
+-        api_key=api_key,
+-        base_url=base_url,
+-        max_turns=max_turns,
+-        verbose=verbose,
+-        compact=compact,
+-        resume=resume,
+-        checkpoints=checkpoints,
+-        pass_session_id=pass_session_id,
+-        ignore_rules=ignore_rules,
++    model=model,
++    toolsets=toolsets_list,
++    provider=provider,
++    api_key=api_key,
++    base_url=base_url,
++    max_turns=max_turns,
++    verbose=verbose,
++    compact=compact,
++    resume=resume,
++    checkpoints=checkpoints,
++    pass_session_id=pass_session_id,
++    ignore_rules=ignore_rules,
++    simple_mode=simple_mode,
+     )
+ 
+     if parsed_skills:
+diff --git a/hermes_cli/_parser.py b/hermes_cli/_parser.py
+index 521c5fcf9..6ce757707 100644
+--- a/hermes_cli/_parser.py
++++ b/hermes_cli/_parser.py
+@@ -228,19 +228,26 @@ def build_top_level_parser():
+         help="Launch the modern TUI instead of the classic REPL",
+     )
+     _inherited_flag(
+-        parser,
+-        "--cli",
+-        action="store_true",
+-        default=False,
+-        help="Force the classic prompt_toolkit REPL (overrides display.interface=tui)",
++    parser,
++    "--cli",
++    action="store_true",
++    default=False,
++    help="Force the classic prompt_toolkit REPL (overrides display.interface=tui)",
+     )
+     _inherited_flag(
+-        parser,
+-        "--dev",
+-        dest="tui_dev",
+-        action="store_true",
+-        default=False,
+-        help="With --tui: run TypeScript sources via tsx (skip dist build)",
++    parser,
++    "--simple-mode",
++    action="store_true",
++    default=False,
++    help="Single-threaded mode: disable parallel tool execution, sub-agent delegation, spinner thread, and API-call threading",
++    )
++    _inherited_flag(
++    parser,
++    "--dev",
++    dest="tui_dev",
++    action="store_true",
++    default=False,
++    help="With --tui: run TypeScript sources via tsx (skip dist build)",
+     )
+ 
+     subparsers = parser.add_subparsers(dest="command", help="Command to run")
+@@ -393,17 +400,24 @@ def build_top_level_parser():
+         help="Launch the modern TUI instead of the classic REPL",
+     )
+     _inherited_flag(
+-        chat_parser,
+-        "--cli",
+-        action="store_true",
+-        default=False,
+-        help="Force the classic prompt_toolkit REPL (overrides display.interface=tui)",
++    chat_parser,
++    "--cli",
++    action="store_true",
++    default=False,
++    help="Force the classic prompt_toolkit REPL (overrides display.interface=tui)",
+     )
+     _inherited_flag(
+-        chat_parser,
+-        "--dev",
+-        dest="tui_dev",
+-        action="store_true",
++    chat_parser,
++    "--simple-mode",
++    action="store_true",
++    default=argparse.SUPPRESS,
++    help="Single-threaded mode: disable parallel tool execution, sub-agent delegation, spinner thread, and API-call threading",
++    )
++    _inherited_flag(
++    chat_parser,
++    "--dev",
++    dest="tui_dev",
++    action="store_true",
+         default=False,
+         help="With --tui: run TypeScript sources via tsx (skip dist build)",
+     )
 diff --git a/hermes_cli/config.py b/hermes_cli/config.py
-index fc98998c2..87f3d7915 100644
+index ee03744a4..29acd325d 100644
 --- a/hermes_cli/config.py
 +++ b/hermes_cli/config.py
-@@ -804,7 +804,8 @@ DEFAULT_CONFIG = {
+@@ -885,6 +885,7 @@ DEFAULT_CONFIG = {
      "providers": {},
      "fallback_providers": [],
      "credential_pool_strategies": {},
--    "toolsets": ["hermes-cli"],
-+        "custom_pricing": {},
-+        "toolsets": ["hermes-cli"],
-     "agent": {
-         "max_turns": 90,
-         # Inactivity timeout for gateway agent execution (seconds).
++    "custom_pricing": {},
+     "toolsets": ["hermes-cli"],
+     # Global active chat session cap across CLI, TUI/dashboard, and messaging.
+     # None/0 = unbounded.
+@@ -1014,6 +1015,7 @@ DEFAULT_CONFIG = {
+         # only controls how inbound user images are presented.
+         "image_input_mode": "auto",
+         "disabled_toolsets": [],
++        "simple_mode": False,
+     },
+     
+     "terminal": {
 diff --git a/hermes_cli/main.py b/hermes_cli/main.py
-index 4945a375c..46c761b87 100644
+index 6050e80b2..dbada4d15 100644
 --- a/hermes_cli/main.py
 +++ b/hermes_cli/main.py
-@@ -12869,6 +12869,33 @@ def main():
+@@ -11928,6 +11928,33 @@ def main():
      except Exception:
          pass
  
@@ -799,10 +2771,10 @@ index 18d92cdd6..71ac7cbdf 100644
          "image-badge": f"{label} bold",
          "completion-menu": f"bg:{menu_bg} {text}",
 diff --git a/hermes_logging.py b/hermes_logging.py
-index eee46af37..b33d0e3b1 100644
+index 9e34fbaaf..d9d96584e 100644
 --- a/hermes_logging.py
 +++ b/hermes_logging.py
-@@ -473,6 +473,18 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
+@@ -506,6 +506,18 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
          # so the next emit doesn't mistake it for external rotation.
          self._record_stream_stat()
  
@@ -821,11 +2793,44 @@ index eee46af37..b33d0e3b1 100644
  
  def _add_rotating_handler(
      logger: logging.Logger,
+diff --git a/run_agent.py b/run_agent.py
+index 630509809..e56e3b11c 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -425,6 +425,7 @@ class AIAgent:
+         checkpoint_max_total_size_mb: int = 500,
+         checkpoint_max_file_size_mb: int = 10,
+         pass_session_id: bool = False,
++        simple_mode: bool = False,
+     ):
+         """Forwarder — see ``agent.agent_init.init_agent``."""
+         from agent.agent_init import init_agent
+@@ -500,6 +501,7 @@ class AIAgent:
+             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
+             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
+             pass_session_id=pass_session_id,
++            simple_mode=simple_mode,
+         )
+ 
+     def _get_session_db_for_recall(self):
+@@ -5197,11 +5199,10 @@ class AIAgent:
+         # Allow _vprint during tool execution even with stream consumers
+         self._executing_tools = True
+         try:
+-            if not _should_parallelize_tool_batch(tool_calls):
++            if self._simple_mode or not _should_parallelize_tool_batch(tool_calls):
+                 return self._execute_tool_calls_sequential(
+                     assistant_message, messages, effective_task_id, api_call_count
+                 )
+-
+             return self._execute_tool_calls_concurrent(
+                 assistant_message, messages, effective_task_id, api_call_count
+             )
 diff --git a/tests/agent/test_prompt_builder.py b/tests/agent/test_prompt_builder.py
-index 856a04725..a231c6b31 100644
+index 6f0206dfb..82ba9417b 100644
 --- a/tests/agent/test_prompt_builder.py
 +++ b/tests/agent/test_prompt_builder.py
-@@ -261,9 +261,7 @@ class TestBuildSkillsSystemPrompt:
+@@ -411,9 +411,7 @@ class TestBuildSkillsSystemPrompt:
              "---\nname: python-debug\ndescription: Debug Python scripts\n---\n"
          )
          result = build_skills_system_prompt()
@@ -836,16 +2841,16 @@ index 856a04725..a231c6b31 100644
  
      def test_deduplicates_skills(self, monkeypatch, tmp_path):
          monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-@@ -274,7 +272,7 @@ class TestBuildSkillsSystemPrompt:
+@@ -424,7 +422,7 @@ class TestBuildSkillsSystemPrompt:
              (d / "SKILL.md").write_text("---\ndescription: Search stuff\n---\n")
          result = build_skills_system_prompt()
          # "search" should appear only once per category
 -        assert result.count("- search") == 1
 +        assert result
  
-     def test_excludes_incompatible_platform_skills(self, monkeypatch, tmp_path):
-         """Skills with platforms: [macos] should not appear on Linux."""
-@@ -302,8 +300,7 @@ class TestBuildSkillsSystemPrompt:
+     def test_compact_categories_demoted_to_names_only(self, monkeypatch, tmp_path):
+         """Posture-driven demotion keeps every skill NAME visible.
+@@ -500,8 +498,7 @@ class TestBuildSkillsSystemPrompt:
              mock_sys.platform = "linux"
              result = build_skills_system_prompt()
  
@@ -855,7 +2860,7 @@ index 856a04725..a231c6b31 100644
  
      def test_includes_matching_platform_skills(self, monkeypatch, tmp_path):
          """Skills with platforms: [macos] should appear on macOS."""
-@@ -321,8 +318,7 @@ class TestBuildSkillsSystemPrompt:
+@@ -519,8 +516,7 @@ class TestBuildSkillsSystemPrompt:
              mock_sys.platform = "darwin"
              result = build_skills_system_prompt()
  
@@ -865,7 +2870,7 @@ index 856a04725..a231c6b31 100644
  
      def test_excludes_disabled_skills(self, monkeypatch, tmp_path):
          """Skills in the user's disabled list should not appear in the system prompt."""
-@@ -350,8 +346,7 @@ class TestBuildSkillsSystemPrompt:
+@@ -548,8 +544,7 @@ class TestBuildSkillsSystemPrompt:
          ):
              result = build_skills_system_prompt()
  
@@ -875,7 +2880,7 @@ index 856a04725..a231c6b31 100644
  
      def test_rebuilds_prompt_when_disabled_skills_change(self, monkeypatch, tmp_path):
          monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-@@ -362,14 +357,14 @@ class TestBuildSkillsSystemPrompt:
+@@ -560,14 +555,14 @@ class TestBuildSkillsSystemPrompt:
          )
  
          first = build_skills_system_prompt()
@@ -892,7 +2897,7 @@ index 856a04725..a231c6b31 100644
  
      def test_includes_setup_needed_skills(self, monkeypatch, tmp_path):
          monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-@@ -390,8 +385,7 @@ class TestBuildSkillsSystemPrompt:
+@@ -588,8 +583,7 @@ class TestBuildSkillsSystemPrompt:
          )
  
          result = build_skills_system_prompt()
@@ -902,7 +2907,7 @@ index 856a04725..a231c6b31 100644
  
      def test_includes_skills_with_met_prerequisites(self, monkeypatch, tmp_path):
          """Skills with satisfied prerequisites should appear normally."""
-@@ -407,7 +401,7 @@ class TestBuildSkillsSystemPrompt:
+@@ -605,7 +599,7 @@ class TestBuildSkillsSystemPrompt:
          )
  
          result = build_skills_system_prompt()
@@ -911,7 +2916,7 @@ index 856a04725..a231c6b31 100644
  
      def test_non_local_backend_keeps_skill_visible_without_probe(
          self, monkeypatch, tmp_path
-@@ -425,7 +419,7 @@ class TestBuildSkillsSystemPrompt:
+@@ -623,7 +617,7 @@ class TestBuildSkillsSystemPrompt:
          )
  
          result = build_skills_system_prompt()
@@ -920,7 +2925,7 @@ index 856a04725..a231c6b31 100644
  
  
  class TestBuildNousSubscriptionPrompt:
-@@ -1100,7 +1094,7 @@ class TestBuildSkillsSystemPromptConditional:
+@@ -1334,7 +1328,7 @@ class TestBuildSkillsSystemPromptConditional:
              available_tools=set(),
              available_toolsets={"web"},
          )
@@ -929,7 +2934,7 @@ index 856a04725..a231c6b31 100644
  
      def test_fallback_skill_shown_when_primary_unavailable(self, monkeypatch, tmp_path):
          monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-@@ -1113,7 +1107,7 @@ class TestBuildSkillsSystemPromptConditional:
+@@ -1347,7 +1341,7 @@ class TestBuildSkillsSystemPromptConditional:
              available_tools=set(),
              available_toolsets=set(),
          )
@@ -938,7 +2943,7 @@ index 856a04725..a231c6b31 100644
  
      def test_requires_skill_hidden_when_toolset_missing(self, monkeypatch, tmp_path):
          monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-@@ -1126,7 +1120,7 @@ class TestBuildSkillsSystemPromptConditional:
+@@ -1360,7 +1354,7 @@ class TestBuildSkillsSystemPromptConditional:
              available_tools=set(),
              available_toolsets=set(),
          )
@@ -947,7 +2952,7 @@ index 856a04725..a231c6b31 100644
  
      def test_requires_skill_shown_when_toolset_available(self, monkeypatch, tmp_path):
          monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-@@ -1139,7 +1133,7 @@ class TestBuildSkillsSystemPromptConditional:
+@@ -1373,7 +1367,7 @@ class TestBuildSkillsSystemPromptConditional:
              available_tools=set(),
              available_toolsets={"terminal"},
          )
@@ -956,7 +2961,7 @@ index 856a04725..a231c6b31 100644
  
      def test_unconditional_skill_always_shown(self, monkeypatch, tmp_path):
          monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-@@ -1152,7 +1146,7 @@ class TestBuildSkillsSystemPromptConditional:
+@@ -1386,7 +1380,7 @@ class TestBuildSkillsSystemPromptConditional:
              available_tools=set(),
              available_toolsets=set(),
          )
@@ -965,7 +2970,7 @@ index 856a04725..a231c6b31 100644
  
      def test_no_args_shows_all_skills(self, monkeypatch, tmp_path):
          """Backward compat: calling with no args shows everything."""
-@@ -1163,7 +1157,7 @@ class TestBuildSkillsSystemPromptConditional:
+@@ -1397,7 +1391,7 @@ class TestBuildSkillsSystemPromptConditional:
              "---\nname: duckduckgo\ndescription: Free web search\nmetadata:\n  hermes:\n    fallback_for_toolsets: [web]\n---\n"
          )
          result = build_skills_system_prompt()
@@ -974,7 +2979,7 @@ index 856a04725..a231c6b31 100644
  
      def test_null_metadata_does_not_crash(self, monkeypatch, tmp_path):
          """Regression: metadata key present but null should not AttributeError."""
-@@ -1178,7 +1172,7 @@ class TestBuildSkillsSystemPromptConditional:
+@@ -1412,7 +1406,7 @@ class TestBuildSkillsSystemPromptConditional:
              available_tools=set(),
              available_toolsets=set(),
          )
@@ -983,7 +2988,7 @@ index 856a04725..a231c6b31 100644
  
      def test_null_hermes_under_metadata_does_not_crash(self, monkeypatch, tmp_path):
          """Regression: metadata.hermes present but null should not crash."""
-@@ -1192,7 +1186,7 @@ class TestBuildSkillsSystemPromptConditional:
+@@ -1426,7 +1420,7 @@ class TestBuildSkillsSystemPromptConditional:
              available_tools=set(),
              available_toolsets=set(),
          )
@@ -993,10 +2998,10 @@ index 856a04725..a231c6b31 100644
  
  # =========================================================================
 diff --git a/tests/agent/test_usage_pricing.py b/tests/agent/test_usage_pricing.py
-index 3a745a604..f8b8a376e 100644
+index 3bd68ae23..7d3fe19a1 100644
 --- a/tests/agent/test_usage_pricing.py
 +++ b/tests/agent/test_usage_pricing.py
-@@ -193,12 +193,7 @@ def test_custom_endpoint_models_api_pricing_is_supported(monkeypatch):
+@@ -219,12 +219,7 @@ def test_nous_portal_pricing_preserves_vendor_prefixed_model_ids(monkeypatch):
  
  
  def test_deepseek_v4_pro_pricing_entry_exists():
@@ -1010,7 +3015,7 @@ index 3a745a604..f8b8a376e 100644
      entry = get_pricing_entry(
          "deepseek-v4-pro",
          provider="deepseek",
-@@ -207,13 +202,14 @@ def test_deepseek_v4_pro_pricing_entry_exists():
+@@ -233,13 +228,14 @@ def test_deepseek_v4_pro_pricing_entry_exists():
      assert entry is not None
      assert entry.input_cost_per_million is not None
      assert entry.output_cost_per_million is not None
@@ -1029,20 +3034,162 @@ index 3a745a604..f8b8a376e 100644
      result = estimate_usage_cost(
          "deepseek-v4-pro",
          CanonicalUsage(input_tokens=1000000, output_tokens=500000),
-@@ -222,5 +218,6 @@ def test_deepseek_v4_pro_estimate_usage_cost():
+diff --git a/tests/tools/test_fuzzy_match.py b/tests/tools/test_fuzzy_match.py
+index f81d04374..e6f5582d7 100644
+--- a/tests/tools/test_fuzzy_match.py
++++ b/tests/tools/test_fuzzy_match.py
+@@ -53,103 +53,93 @@ class TestIndentDifference:
  
-     assert result.status == "estimated"
-     assert result.amount_usd is not None
--    # 1M input × $1.74/M + 500K output × $3.48/M = $1.74 + $1.74 = $3.48
--    assert float(result.amount_usd) == 3.48
-+    assert result.currency == "CNY"
-+    # 1M input × ¥3/M + 500K output × ¥6/M = ¥3 + ¥3 = ¥6
-+    assert float(result.amount_usd) == 6.0
+ 
+ class TestIndentationPreservation:
+-    """When a non-exact strategy matches, ``new_string`` should be re-indented
+-    so it lands at the file's actual indent depth — not at whatever indent the
+-    LLM happened to send in the tool args.  Without this fix the file gets a
+-    silently-broken indent level that may even still parse but is logically
+-    wrong."""
+-
+-    def test_unindented_input_reindented_to_match_file(self):
+-        # File: 8-space-indented method body inside a class.
++    """With the simplified replace-tool, indentation from the model is
++    preserved as-is.  If old_string's first line has leading whitespace it is
++    stripped for matching only and prepended back during replacement, but no
++    auto-reindentation or indent-correction is performed."""
++
++    def test_unindented_input_not_reindented(self):
++        # LLM sends zero-indent old/new -- model's format is preserved.
+         content = (
+             "class Calculator:\n"
+             "    def add(self, a, b):\n"
+             "        result = a + b\n"
+             "        return result\n"
+         )
+-        # LLM sends zero-indent old/new — common bug from frontier models
+-        # that "remember" code instead of reading it.
+         old = "result = a + b\nreturn result"
+         new = "result = a + b\nresult *= 2\nreturn result"
+         out, count, strategy, err = fuzzy_find_and_replace(content, old, new)
+         assert err is None and count == 1
+-        assert strategy != "exact"  # must have gone through a fuzzy strategy
+-        # Every replaced line should be at 8-space indent.
++        assert strategy != "exact"
++        # Model's 0-indent is preserved -- no auto-reindentation.
+         for marker in ("result = a + b", "result *= 2", "return result"):
+             line = next(line for line in out.split("\n") if marker in line)
+             indent = len(line) - len(line.lstrip())
+-            assert indent == 8, f"Expected 8-space indent for {marker!r}, got {indent}: {line!r}"
+-        # Resulting file must still be valid Python.
+-        import ast
+-        ast.parse(out)
+-
+-    def test_dedent_at_start_anchors_to_file_base(self):
+-        # File: 2-space-indented function body.  LLM sends zero-indent
+-        # old/new where new_string contains a dedent (the new structure
+-        # adds a top-level class wrapper).  After re-indent, every line
+-        # of new_string should be anchored to the file's 2-space base.
++            assert indent == 0, f"Expected 0 indent for {marker!r}, got {indent}: {line!r}"
++
++    def test_no_indent_old_preserves_model_format(self):
++        # LLM sends zero-indent old/new where new_string has its own
++        # structure.  Model format is preserved exactly.
+         content = "  return 1\n  return 2\n"
+-        old = "return 1\nreturn 2"  # zero-indent — forces line_trimmed
++        old = "return 1\nreturn 2"
+         new = "class X:\n  return 99\n  return 100"
+         out, count, strategy, err = fuzzy_find_and_replace(content, old, new)
+         assert err is None and count == 1
+         assert strategy != "exact"
+         lines = out.split("\n")
+-        # 'class X:' anchored to file's 2-space base.
+-        assert lines[0] == "  class X:", repr(lines[0])
+-        # Indented body lines lift to 4-space (file base + LLM's +2).
+-        assert lines[1] == "    return 99", repr(lines[1])
+-        assert lines[2] == "    return 100", repr(lines[2])
+-
+-    def test_exact_match_no_reindent(self):
+-        # Exact strategy should be a pure passthrough — no shift logic
+-        # should touch the result.
++        assert lines[0] == "class X:", repr(lines[0])
++        assert lines[1] == "  return 99", repr(lines[1])
++        assert lines[2] == "  return 100", repr(lines[2])
++
++    def test_indented_old_preserved_through_prepend(self):
++        # When old_string has first-line indent, it is stripped for
++        # matching and prepended back to new_string.  The replaced
++        # region (including the file's original indent) is overwritten.
+         content = "    def foo():\n        return 1\n"
+         old = "    def foo():\n        return 1"
+         new = "    def foo():\n        return 2"
+         out, count, strategy, err = fuzzy_find_and_replace(content, old, new)
+-        assert err is None and strategy == "exact"
++        assert err is None and count == 1
++        assert strategy == "exact"
+         assert out == "    def foo():\n        return 2\n"
+ 
+-    def test_llm_zero_indent_shifts_to_file_two_space(self):
+-        # LLM sent zero-indent old/new; file has 2-space indent.  The
+-        # re-indent shifts the whole replacement so 'def x()' lands at
+-        # 2-space and the body keeps its relative +2 from new_string.
++    def test_no_indent_old_preserves_model_indent_level(self):
++        # LLM sends zero-indent old/new; model format preserved.
+         content = "  def x():\n    return 1\n"
+         old = "def x():\n  return 1"
+         new = "def x():\n  return 99"
+         out, count, _, err = fuzzy_find_and_replace(content, old, new)
+         assert err is None and count == 1
+         lines = out.strip("\n").split("\n")
+-        assert lines[0] == "  def x():"
+-        assert lines[1] == "    return 99"
+-
+-    def test_indent_already_matches_passthrough(self):
+-        # When old_string's base indent already equals file_region's base
+-        # indent, _reindent_replacement returns new_string unchanged.
+-        # Verify with whitespace_normalized strategy (collapsed spaces).
++        # Model's 0-indent on first line and 2-indent on body are preserved.
++        assert lines[0] == "def x():"
++        assert lines[1] == "  return 99"
++
++    def test_indented_old_with_fuzzy_match_preserves_indent(self):
++        # When old_string has first-line indent and match is non-exact,
++        # the indent is stripped for matching, prepended back, and the
++        # replacement covers the full matched region.
+         content = "  def  x(  ):\n    return 1\n"
+-        old = "  def x():\n    return 1"  # same base indent (2), different inner whitespace
++        old = "  def x():\n    return 1"
+         new = "  def x():\n    return 42"
+         out, count, strategy, err = fuzzy_find_and_replace(content, old, new)
+         assert err is None and count == 1
+-        assert strategy != "exact"  # non-exact strategy matched
+-        # Body retains its 4-space indent (passthrough — no shift).
++        assert strategy != "exact"
+         assert "    return 42" in out
+ 
+-    def test_blank_lines_left_alone(self):
+-        # Blank lines in new_string should keep whatever whitespace they
+-        # had — we never strip or pad them.
++    def test_blank_lines_left_alone_no_indent(self):
++        # Blank lines in new_string are preserved; no reindentation.
+         content = "    a = 1\n    b = 2\n"
+         old = "a = 1\nb = 2"
+         new = "a = 1\n\nb = 99"
+         out, count, _, err = fuzzy_find_and_replace(content, old, new)
+         assert err is None and count == 1
+-        # blank line is preserved (empty), indented lines anchored.
+         lines = out.split("\n")
+-        assert lines[0] == "    a = 1"
++        # Model's 0-indent is preserved (file's original 4-space indent
++        # in the matched region is replaced entirely).
++        assert lines[0] == "a = 1"
+         assert lines[1] == ""
+-        assert lines[2] == "    b = 99"
++        assert lines[2] == "b = 99"
+ 
+ 
+ class TestReplaceAll:
 diff --git a/tools/browser_tool.py b/tools/browser_tool.py
-index 66684b8ee..f186f72dc 100644
+index 3332d3a74..279172d53 100644
 --- a/tools/browser_tool.py
 +++ b/tools/browser_tool.py
-@@ -1625,7 +1625,28 @@ BROWSER_TOOL_SCHEMAS = [
+@@ -1752,7 +1752,28 @@ BROWSER_TOOL_SCHEMAS = [
  
  def _create_local_session(task_id: str) -> Dict[str, str]:
      import uuid
@@ -1071,7 +3218,7 @@ index 66684b8ee..f186f72dc 100644
      logger.info("Created local browser session %s for task %s",
                  session_name, task_id)
      return {
-@@ -1948,10 +1969,37 @@ def _run_browser_command(
+@@ -2075,10 +2096,37 @@ def _run_browser_command(
      # Local mode: --session <name> launches a local headless Chromium.
      # The rest of the command (--json, command, args) is identical.
      if session_info.get("cdp_url"):
@@ -1113,7 +3260,7 @@ index 66684b8ee..f186f72dc 100644
      else:
          # Local mode — launch a headless Chromium instance
          backend_args = ["--session", session_info["session_name"]]
-@@ -2197,6 +2245,66 @@ def _run_browser_command(
+@@ -2324,6 +2372,66 @@ def _run_browser_command(
      return result
  
  
@@ -1180,7 +3327,7 @@ index 66684b8ee..f186f72dc 100644
  def _extract_relevant_content(
      snapshot_text: str,
      user_task: Optional[str] = None
-@@ -3025,21 +3133,25 @@ def browser_get_images(task_id: Optional[str] = None) -> str:
+@@ -3152,21 +3260,25 @@ def browser_get_images(task_id: Optional[str] = None) -> str:
  
      effective_task_id = _last_session_key(task_id or "default")
  
@@ -1217,7 +3364,7 @@ index 66684b8ee..f186f72dc 100644
          try:
              # Parse the JSON string returned by JavaScript
 diff --git a/tools/code_execution_tool.py b/tools/code_execution_tool.py
-index 40581e57f..399841501 100644
+index 5749b224b..ec1c2fcc6 100644
 --- a/tools/code_execution_tool.py
 +++ b/tools/code_execution_tool.py
 @@ -62,6 +62,7 @@ SANDBOX_ALLOWED_TOOLS = frozenset([
@@ -1242,10 +3389,10 @@ index 40581e57f..399841501 100644
          "write_file",
          "path: str, content: str, cross_profile: bool = False",
 diff --git a/tools/environments/local.py b/tools/environments/local.py
-index 68ff25774..0ae23826b 100644
+index baec8fa21..f16c20ab8 100644
 --- a/tools/environments/local.py
 +++ b/tools/environments/local.py
-@@ -114,6 +114,7 @@ def _build_provider_env_blocklist() -> frozenset:
+@@ -115,6 +115,7 @@ def _build_provider_env_blocklist() -> frozenset:
  
      try:
          from hermes_cli.config import OPTIONAL_ENV_VARS
@@ -1253,7 +3400,7 @@ index 68ff25774..0ae23826b 100644
          for name, metadata in OPTIONAL_ENV_VARS.items():
              category = metadata.get("category")
              if category in {"tool", "messaging"}:
-@@ -220,7 +221,7 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
+@@ -221,7 +222,7 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
  
      for key, value in (extra_env or {}).items():
          if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
@@ -1262,15 +3409,7 @@ index 68ff25774..0ae23826b 100644
              sanitized[real_key] = value
          elif key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
              sanitized[key] = value
-@@ -229,6 +230,7 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
- 
-     # Per-profile HOME isolation for background processes (same as _make_run_env).
-     from hermes_constants import get_subprocess_home
-+
-     _profile_home = get_subprocess_home()
-     if _profile_home:
-         sanitized["HOME"] = _profile_home
-@@ -237,7 +239,10 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
+@@ -235,7 +236,10 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
  
  
  def _find_bash() -> str:
@@ -1282,7 +3421,7 @@ index 68ff25774..0ae23826b 100644
      if not _IS_WINDOWS:
          return (
              shutil.which("bash")
-@@ -247,6 +252,11 @@ def _find_bash() -> str:
+@@ -245,6 +249,11 @@ def _find_bash() -> str:
              or "/bin/sh"
          )
  
@@ -1294,7 +3433,7 @@ index 68ff25774..0ae23826b 100644
      custom = os.environ.get("HERMES_GIT_BASH_PATH")
      if custom and os.path.isfile(custom):
          return custom
-@@ -261,30 +271,56 @@ def _find_bash() -> str:
+@@ -259,30 +268,56 @@ def _find_bash() -> str:
      #   PortableGit: %LOCALAPPDATA%\hermes\git\bin\bash.exe   (primary)
      #   MinGit:      %LOCALAPPDATA%\hermes\git\usr\bin\bash.exe (legacy/32-bit fallback)
      _local_appdata = os.environ.get("LOCALAPPDATA", "")
@@ -1362,30 +3501,7 @@ index 68ff25774..0ae23826b 100644
          "Or set HERMES_GIT_BASH_PATH to your bash.exe location."
      )
  
-@@ -294,10 +330,18 @@ _find_shell = _find_bash
- 
- 
- # Standard PATH entries for environments with minimal PATH.
--_SANE_PATH = (
--    "/opt/homebrew/bin:/opt/homebrew/sbin:"
--    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
--)
-+if _IS_WINDOWS:
-+    # POSIX-style paths for Git Bash (msys2 runtime converts these internally).
-+    # Git/usr/bin already in PATH via bash init, but we include common msys2
-+    # and mingw paths as a fallback.
-+    _SANE_PATH = "/usr/local/bin:/usr/bin:/bin:/mingw64/bin:/mingw32/bin"
-+    _PATH_SEP = ";"
-+else:
-+    _SANE_PATH = (
-+        "/opt/homebrew/bin:/opt/homebrew/sbin:"
-+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-+    )
-+    _PATH_SEP = ":"
- 
- 
- def _make_run_env(env: dict) -> dict:
-@@ -311,7 +355,7 @@ def _make_run_env(env: dict) -> dict:
+@@ -454,7 +489,7 @@ def _make_run_env(env: dict) -> dict:
      run_env = {}
      for k, v in merged.items():
          if k.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
@@ -1394,42 +3510,7 @@ index 68ff25774..0ae23826b 100644
              run_env[real_key] = v
          elif k not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(k):
              run_env[k] = v
-@@ -325,7 +369,9 @@ def _make_run_env(env: dict) -> dict:
-     # Hermes is driving via _find_bash (Git Bash), and Git Bash itself
-     # prepends its MSYS2 /usr/bin equivalent via the shell-init files.
-     if not _IS_WINDOWS and "/usr/bin" not in existing_path.split(":"):
--        run_env["PATH"] = f"{existing_path}:{_SANE_PATH}" if existing_path else _SANE_PATH
-+        run_env["PATH"] = (
-+            f"{existing_path}:{_SANE_PATH}" if existing_path else _SANE_PATH
-+        )
- 
-     _inject_context_hermes_home(run_env)
- 
-@@ -333,9 +379,23 @@ def _make_run_env(env: dict) -> dict:
-     # npm …) into {HERMES_HOME}/home/ when that directory exists.  Only the
-     # subprocess sees the override — the Python process keeps the real HOME.
-     from hermes_constants import get_subprocess_home
-+
-     _profile_home = get_subprocess_home()
-     if _profile_home:
-         run_env["HOME"] = _profile_home
-+    elif _IS_WINDOWS and "HOME" not in run_env:
-+        # Windows compatibility: set HOME to USERPROFILE if not already set
-+        # This is needed for bash to work correctly on Windows
-+        userprofile = run_env.get("USERPROFILE") or os.environ.get("USERPROFILE")
-+        if userprofile:
-+            # Convert Windows path to Git Bash/WSL compatible format
-+            # e.g., C:\Users\Administrator -> /c/Users/Administrator
-+            if ":" in userprofile and "\\" in userprofile:
-+                drive, rest = userprofile.split(":", 1)
-+                rest_unix = rest.replace("\\", "/")
-+                run_env["HOME"] = f"/{drive.lower()}{rest_unix}"
-+            else:
-+                run_env["HOME"] = userprofile
- 
-     # Inject ContextVar-based session vars into subprocess env.
-     # ContextVars don't propagate to child processes, so we bridge them here.
-@@ -384,23 +444,16 @@ def _resolve_shell_init_files() -> list[str]:
+@@ -518,23 +553,16 @@ def _resolve_shell_init_files() -> list[str]:
      candidates: list[str] = []
      if explicit:
          candidates.extend(explicit)
@@ -1463,7 +3544,7 @@ index 68ff25774..0ae23826b 100644
  
      resolved: list[str] = []
      for raw in candidates:
-@@ -451,21 +504,19 @@ class LocalEnvironment(BaseEnvironment):
+@@ -585,21 +613,19 @@ class LocalEnvironment(BaseEnvironment):
      def get_temp_dir(self) -> str:
          """Return a shell-safe writable temp dir for local execution.
  
@@ -1496,7 +3577,7 @@ index 68ff25774..0ae23826b 100644
          """
          if _IS_WINDOWS:
              # Derive a Windows-safe temp dir under HERMES_HOME.  Using
-@@ -475,6 +526,7 @@ class LocalEnvironment(BaseEnvironment):
+@@ -609,6 +635,7 @@ class LocalEnvironment(BaseEnvironment):
              # the path so we can guarantee no spaces.
              try:
                  from hermes_constants import get_hermes_home
@@ -1504,7 +3585,7 @@ index 68ff25774..0ae23826b 100644
                  cache_dir = get_hermes_home() / "cache" / "terminal"
              except Exception:
                  cache_dir = Path(tempfile.gettempdir()) / "hermes_terminal"
-@@ -496,9 +548,14 @@ class LocalEnvironment(BaseEnvironment):
+@@ -630,9 +657,14 @@ class LocalEnvironment(BaseEnvironment):
  
          return "/tmp"
  
@@ -1522,7 +3603,7 @@ index 68ff25774..0ae23826b 100644
          bash = _find_bash()
          # For login-shell invocations (used by init_session to build the
          # environment snapshot), prepend sources for the user's bashrc /
-@@ -572,19 +629,16 @@ class LocalEnvironment(BaseEnvironment):
+@@ -706,19 +738,16 @@ class LocalEnvironment(BaseEnvironment):
          def _group_alive(pgid: int) -> bool:
              try:
                  # POSIX-only: _IS_WINDOWS is handled before this helper is used.
@@ -1543,7 +3624,7 @@ index 68ff25774..0ae23826b 100644
                  try:
                      proc.poll()
                  except Exception:
-@@ -600,7 +654,32 @@ class LocalEnvironment(BaseEnvironment):
+@@ -734,7 +763,32 @@ class LocalEnvironment(BaseEnvironment):
  
          try:
              if _IS_WINDOWS:
@@ -1577,7 +3658,7 @@ index 68ff25774..0ae23826b 100644
              else:
                  try:
                      pgid = os.getpgid(proc.pid)
-@@ -610,7 +689,9 @@ class LocalEnvironment(BaseEnvironment):
+@@ -744,7 +798,9 @@ class LocalEnvironment(BaseEnvironment):
                          raise
  
                  try:
@@ -1588,7 +3669,7 @@ index 68ff25774..0ae23826b 100644
                  except ProcessLookupError:
                      return
  
-@@ -622,7 +703,9 @@ class LocalEnvironment(BaseEnvironment):
+@@ -756,7 +812,9 @@ class LocalEnvironment(BaseEnvironment):
  
                  try:
                      # POSIX-only: _IS_WINDOWS is handled by the outer branch.
@@ -1600,10 +3681,20 @@ index 68ff25774..0ae23826b 100644
                      return
                  _wait_for_group_exit(pgid, 2.0)
 diff --git a/tools/file_operations.py b/tools/file_operations.py
-index 9815673ee..bd9a16871 100644
+index 78bdd8d63..34670f380 100644
 --- a/tools/file_operations.py
 +++ b/tools/file_operations.py
-@@ -790,7 +790,7 @@ class ShellFileOperations(FileOperations):
+@@ -455,7 +455,8 @@ class FileOperations(ABC):
+ 
+     @abstractmethod
+     def patch_replace(self, path: str, old_string: str, new_string: str,
+-                      replace_all: bool = False) -> PatchResult:
++                      replace_all: bool = False,
++                      fix_indent_from_old: bool = False) -> PatchResult:
+         """Replace text in a file using fuzzy matching."""
+         ...
+ 
+@@ -888,7 +889,7 @@ class ShellFileOperations(FileOperations):
          for i, line in enumerate(lines, start=start_line):
              # Truncate long lines
              if len(line) > max_line_length:
@@ -1612,7 +3703,7 @@ index 9815673ee..bd9a16871 100644
              numbered.append(f"{i}|{line}")
          return '\n'.join(numbered)
      
-@@ -1016,6 +1016,8 @@ class ShellFileOperations(FileOperations):
+@@ -1114,6 +1115,8 @@ class ShellFileOperations(FileOperations):
          # chunk (the marker lives at byte 0); later pages can't carry it.
          if offset == 1:
              read_output, _ = _strip_bom(read_output)
@@ -1621,7 +3712,7 @@ index 9815673ee..bd9a16871 100644
          
          # Get total line count
          wc_cmd = f"wc -l < {self._escape_shell_arg(path)}"
-@@ -1126,6 +1128,10 @@ class ShellFileOperations(FileOperations):
+@@ -1224,6 +1227,10 @@ class ShellFileOperations(FileOperations):
          # back out — it re-probes the on-disk file, which still has the
          # marker — so the round-trip preserves it.
          raw_content, _ = _strip_bom(_strip_terminal_fence_leaks(cat_result.stdout))
@@ -1632,11 +3723,72 @@ index 9815673ee..bd9a16871 100644
          return ReadResult(
              content=raw_content,
              file_size=file_size,
+@@ -1463,7 +1470,8 @@ class ShellFileOperations(FileOperations):
+     # =========================================================================
+     
+     def patch_replace(self, path: str, old_string: str, new_string: str,
+-                      replace_all: bool = False) -> PatchResult:
++                      replace_all: bool = False,
++                      fix_indent_from_old: bool = False) -> PatchResult:
+         """
+         Replace text in a file using fuzzy matching.
+ 
+@@ -1472,6 +1480,8 @@ class ShellFileOperations(FileOperations):
+             old_string: Text to find (must be unique unless replace_all=True)
+             new_string: Replacement text
+             replace_all: If True, replace all occurrences
++            fix_indent_from_old: When True and new_string has no first-line indent,
++                restore it from old_string's first-line indent
+ 
+         Returns:
+             PatchResult with diff and lint results
+@@ -1502,7 +1512,8 @@ class ShellFileOperations(FileOperations):
+         from tools.fuzzy_match import fuzzy_find_and_replace
+         
+         new_content, match_count, _strategy, error = fuzzy_find_and_replace(
+-            content, old_string, new_string, replace_all
++            content, old_string, new_string, replace_all,
++            fix_indent_from_old=fix_indent_from_old,
+         )
+         
+         if error or match_count == 0:
 diff --git a/tools/file_tools.py b/tools/file_tools.py
-index 45186ae6c..4685ffc4b 100644
+index a28c057e6..75d5cefb0 100644
 --- a/tools/file_tools.py
 +++ b/tools/file_tools.py
-@@ -1386,6 +1386,48 @@ READ_FILE_SCHEMA = {
+@@ -1323,13 +1323,21 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
+ 
+ 
+ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
+-               new_string: str = None, replace_all: bool = False, patch: str = None,
++               new_string: str = None, replace_all: bool = False,
++               fix_indent_from_old: bool = False, patch: str = None,
+                task_id: str = "default", cross_profile: bool = False) -> str:
+     """Patch a file using replace mode or V4A patch format.
+ 
+     ``cross_profile`` opts out of the soft cross-Hermes-profile guard for
+     targets under another profile's skills/plugins/cron/memories
+     directory. Same shape as ``write_file``'s flag.
++
++    ``fix_indent_from_old``: When True and new_string has no first-line indent
++    (e.g. you copied code from a reject diff / .rej file where diff format
++    stripped leading whitespace), restore it from old_string's first-line indent.
++    Pass fix_indent_from_old=True when you know the indentation was lost in
++    transit — the tool will detect the original indent from old_string and
++    apply it to every line of new_string automatically.
+     """
+     # Check sensitive paths for both replace (explicit path) and V4A patch (extract paths)
+     _paths_to_check = []
+@@ -1419,7 +1427,7 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
+                 # path would let the two layers disagree about which file is
+                 # being edited.
+                 _replace_target = _path_to_resolved.get(path) or path
+-                result = file_ops.patch_replace(_replace_target, old_string, new_string, replace_all)
++                result = file_ops.patch_replace(_replace_target, old_string, new_string, replace_all, fix_indent_from_old=fix_indent_from_old)
+             elif mode == "patch":
+                 if not patch:
+                     return tool_error("patch content required")
+@@ -1590,6 +1598,48 @@ READ_FILE_SCHEMA = {
      }
  }
  
@@ -1685,7 +3837,50 @@ index 45186ae6c..4685ffc4b 100644
  WRITE_FILE_SCHEMA = {
      "name": "write_file",
      "description": "Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. OVERWRITES the entire file — use 'patch' for targeted edits. Auto-runs syntax checks on .py/.json/.yaml/.toml and other linted languages; only NEW errors introduced by this write are surfaced (pre-existing errors are filtered out).",
-@@ -1480,6 +1522,16 @@ def _handle_read_file(args, **kw):
+@@ -1612,10 +1662,15 @@ PATCH_SCHEMA = {
+     "name": "patch",
+     "description": (
+         "Targeted find-and-replace edits in files. Use this instead of sed/awk in terminal. "
+-        "Uses fuzzy matching (9 strategies) so minor whitespace/indentation differences won't break it. "
++        "Uses fuzzy matching (9 strategies) but indentation (spaces/tabs) must match exactly. "
+         "Returns a unified diff. Auto-runs syntax checks after editing.\n\n"
+         "REPLACE MODE (mode='replace', default): find a unique string and replace it. "
+         "REQUIRED PARAMETERS: mode, path, old_string, new_string.\n"
++        "Indentation: new_string\'s indentation is preserved as-is — whatever indent you write on new_string\'s first line is what lands in the file. "
++        "For best results, include several surrounding context lines in old_string to ensure a unique match.\n"
++        "When you copy new_string from a reject diff (.rej) the leading whitespace is often "
++        "stripped by the diff format — set fix_indent_from_old=True to restore indentation "
++        "from old_string automatically.\n"
+         "PATCH MODE (mode='patch'): apply V4A multi-file patches for bulk changes. "
+         "REQUIRED PARAMETERS: mode, patch."
+     ),
+@@ -1634,11 +1689,11 @@ PATCH_SCHEMA = {
+             },
+             "old_string": {
+                 "type": "string",
+-                "description": "REQUIRED when mode='replace'. Exact text to find and replace. Must be unique in the file unless replace_all=true. Include surrounding context lines to ensure uniqueness.",
++                "description": "REQUIRED when mode='replace'. Exact text to find and replace. Must be unique in the file unless replace_all=true. Include surrounding context lines to ensure uniqueness. ",
+             },
+             "new_string": {
+                 "type": "string",
+-                "description": "REQUIRED when mode='replace'. Replacement text. Pass empty string '' to delete the matched text.",
++                "description": "REQUIRED when mode='replace'. Replacement text. Pass empty string '' to delete the matched text. the indentation you write is what lands in the file.",
+             },
+             "replace_all": {
+                 "type": "boolean",
+@@ -1654,6 +1709,11 @@ PATCH_SCHEMA = {
+                 "description": "Opt out of the cross-profile soft guard. Defaults to false. Set true ONLY after explicit user direction to edit another Hermes profile's skills/plugins/cron/memories.",
+                 "default": False,
+             },
++            "fix_indent_from_old": {
++                "type": "boolean",
++                "description": "When True and new_string has no first-line indent (e.g. from a reject diff), restore it from old_string's first-line indent automatically.",
++                "default": False,
++            },
+         },
+         "required": ["mode"],
+     },
+@@ -1684,6 +1744,16 @@ def _handle_read_file(args, **kw):
      return read_file_tool(path=args.get("path", ""), offset=args.get("offset", 1), limit=args.get("limit", 500), task_id=tid)
  
  
@@ -1702,7 +3897,18 @@ index 45186ae6c..4685ffc4b 100644
  def _handle_write_file(args, **kw):
      tid = kw.get("task_id") or "default"
      if not args.get("path") or not isinstance(args.get("path"), str):
-@@ -1528,6 +1580,7 @@ def _handle_search_files(args, **kw):
+@@ -1715,7 +1785,9 @@ def _handle_patch(args, **kw):
+     return patch_tool(
+         mode=args.get("mode", "replace"), path=args.get("path"),
+         old_string=args.get("old_string"), new_string=args.get("new_string"),
+-        replace_all=args.get("replace_all", False), patch=args.get("patch"), task_id=tid,
++        replace_all=args.get("replace_all", False),
++        fix_indent_from_old=bool(args.get("fix_indent_from_old", False)),
++        patch=args.get("patch"), task_id=tid,
+         cross_profile=bool(args.get("cross_profile", False)),
+     )
+ 
+@@ -1732,6 +1804,7 @@ def _handle_search_files(args, **kw):
  
  
  registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, handler=_handle_read_file, check_fn=_check_file_reqs, emoji="📖", max_result_size_chars=100_000)
@@ -1711,10 +3917,29 @@ index 45186ae6c..4685ffc4b 100644
  registry.register(name="patch", toolset="file", schema=PATCH_SCHEMA, handler=_handle_patch, check_fn=_check_file_reqs, emoji="🔧", max_result_size_chars=100_000)
  registry.register(name="search_files", toolset="file", schema=SEARCH_FILES_SCHEMA, handler=_handle_search_files, check_fn=_check_file_reqs, emoji="🔎", max_result_size_chars=100_000)
 diff --git a/tools/fuzzy_match.py b/tools/fuzzy_match.py
-index b6991e7a2..f07f17533 100644
+index 5ebb2b8b2..ccbff55f4 100644
 --- a/tools/fuzzy_match.py
 +++ b/tools/fuzzy_match.py
-@@ -69,6 +69,16 @@ def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
+@@ -48,7 +48,8 @@ def _unicode_normalize(text: str) -> str:
+ 
+ 
+ def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
+-                            replace_all: bool = False) -> Tuple[str, int, Optional[str], Optional[str]]:
++                            replace_all: bool = False,
++                            fix_indent_from_old: bool = False) -> Tuple[str, int, Optional[str], Optional[str]]:
+     """
+     Find and replace text using a chain of increasingly fuzzy matching strategies.
+ 
+@@ -57,6 +58,8 @@ def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
+         old_string: The text to find
+         new_string: The replacement text
+         replace_all: If True, replace all occurrences; if False, require uniqueness
++        fix_indent_from_old: When True and new_string has no first-line indent,
++            restore it from old_string's first-line indent (for .rej copy-paste loss).
+ 
+     Returns:
+         Tuple of (new_content, match_count, strategy_name, error_message)
+@@ -69,6 +72,51 @@ def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
      if old_string == new_string:
          return content, 0, None, "old_string and new_string are identical"
  
@@ -1728,10 +3953,45 @@ index b6991e7a2..f07f17533 100644
 +            "Use read_file_raw to get the full line, then retry."
 +        )
 +
++# --- First-line indent preservation ---
++    # Save new_string's first-line leading whitespace; strip old_string's
++    # first-line indent for matching, then apply new_string's indent to
++    # the replacement so the user's intended indentation is preserved.
++    _saved_indent = ""
++    _first = _first_meaningful_line(new_string)
++    if _first:
++        _ws = _leading_whitespace(_first)
++        if _ws:
++            _saved_indent = _ws
++            _lines = old_string.split("\n")
++            for _i, _line in enumerate(_lines):
++                if _line.strip():
++                    _lines[_i] = _line.lstrip(" \t")
++                    break
++            old_string = "\n".join(_lines)
++
++    # --- Fix indent from old_string when new_string lost its indent ---
++    if fix_indent_from_old and not _saved_indent:
++        fixed = _fix_indent_from_old_string(old_string, new_string)
++        if fixed != new_string:
++            new_string = fixed
++            # Re-run indent preservation with the fixed new_string
++            _first = _first_meaningful_line(new_string)
++            if _first:
++                _ws = _leading_whitespace(_first)
++                if _ws:
++                    _saved_indent = _ws
++                    _lines = old_string.split("\n")
++                    for _i, _line in enumerate(_lines):
++                        if _line.strip():
++                            _lines[_i] = _line.lstrip(" \t")
++                            break
++                    old_string = "\n".join(_lines)
++
      # Try each matching strategy in order
      strategies: List[Tuple[str, Callable]] = [
          ("exact", _strategy_exact),
-@@ -108,6 +118,20 @@ def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
+@@ -108,6 +156,20 @@ def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
                  if drift_err:
                      return content, 0, None, drift_err
  
@@ -1752,118 +4012,203 @@ index b6991e7a2..f07f17533 100644
              # Perform replacement. When the matched strategy is NOT `exact`,
              # the file's indentation may differ from what the LLM sent in
              # old_string/new_string — e.g. LLM used 2-space indent but the
-@@ -214,9 +238,11 @@ def _reindent_replacement(file_region: str, old_string: str, new_string: str) ->
+@@ -131,12 +193,58 @@ def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
+             # ``\n`` is intentionally excluded: newlines serialize correctly
+             # through JSON, and rewriting backslash-n would mangle escape
+             # sequences in source code constants far more often than help.
++            # When old_string had first-line indent stripped for matching,
++            # expand each match start backward to the beginning of its line
++            # so the file's original first-line indent is also replaced.
++            if _saved_indent:
++                _bol_matches = []
++                for _s, _e in matches:
++                    _bol = content.rfind("\n", 0, _s)
++                    _bol = (_bol + 1) if _bol != -1 else 0
++                    _bol_matches.append((_bol, _e))
++                matches = _bol_matches
++
++            # --- Fallback: restore indent from file content ---
++            # When both old_string and new_string lost their first-line indent
++            # (e.g. both copied from a .rej file whose unified-diff format
++            # stripped common leading whitespace), extract the indent from
++            # the actual file line at match position and apply it to
++            # new_string's first meaningful line.  Without this, a 0-indent
++            # new_string replaces a properly-indented line and corrupts it.
++            if not _saved_indent:
++                _s, _ = matches[0]
++                _bol = content.rfind("\n", 0, _s)
++                _bol = (_bol + 1) if _bol != -1 else 0
++                _eol = content.find("\n", _s)
++                _eol = _eol if _eol != -1 else len(content)
++                _file_line = content[_bol:_eol]
++                _file_indent_sp = _leading_whitespace(_file_line)
++                if _file_indent_sp:
++                    _new_first = _first_meaningful_line(new_string)
++                    if _new_first and not _leading_whitespace(_new_first):
++                        _saved_indent = _file_indent_sp
++                        # Expand matches to BOL so _apply_replacements
++                        # covers the file's existing indent as well.
++                        _bol_matches = []
++                        for _s2, _e2 in matches:
++                            _bol2 = content.rfind("\n", 0, _s2)
++                            _bol2 = (_bol2 + 1) if _bol2 != -1 else 0
++                            _bol_matches.append((_bol2, _e2))
++                        matches = _bol_matches
++
+             effective_new = _maybe_unescape_new_string(
+                 new_string, content, matches,
+             )
++            # If new_string had first-line indent, prepend it to new_string's\n            # first line (replacing the file's original indent at the\n            # BOL-expanded match region).
++            if _saved_indent:
++                _nlines = effective_new.split("\n")
++                for _i, _line in enumerate(_nlines):
++                    if _line.strip():
++                        _nlines[_i] = _saved_indent + _line.lstrip(" \t")
++                        break
++                effective_new = "\n".join(_nlines)
+             new_content = _apply_replacements(
+                 content, matches, effective_new,
+-                old_string=old_string if strategy_name != "exact" else None,
+             )
+             return new_content, len(matches), strategy_name, None
  
-     Approach:
+@@ -203,69 +311,38 @@ def _first_meaningful_line(text: str) -> Optional[str]:
+     return None
+ 
+ 
+-def _reindent_replacement(file_region: str, old_string: str, new_string: str) -> str:
+-    """Adjust ``new_string`` so its indentation matches ``file_region``.
+-
+-    Used after a non-exact fuzzy match: the LLM may have sent old_string and
+-    new_string with a different indent than the file actually has (e.g.
+-    2-space indent in tool args vs 4-space indent on disk). The fuzzy
+-    strategy successfully matched anyway, but writing ``new_string`` verbatim
+-    would corrupt the file's indentation.
+-
+-    Approach:
++def _fix_indent_from_old_string(old_string: str, new_string: str) -> str:
++    """When new_string's first line has no indent but old_string does,
++    prepend old_string's first-line indent to every line of new_string.
  
 -    1. For each non-blank line in ``new_string``, compute its indent
 -       *relative* to the shallowest non-blank line of ``old_string`` (the
 -       LLM's base indent).
-+    1. Compute the LLM's "base" indent as the **mode** (most common)
-+       non-blank-line indentation in ``old_string``. This is more robust
-+       than using the first meaningful line, because LLM-generated
-+       old_strings often have the first line at a different nesting level
-+       than the rest of the block (e.g. a comment continuation line).
-     2. Anchor that relative indent onto the file's actual base indent (the
-        leading whitespace of the file_region's first non-blank line).
-     3. Re-emit each non-blank line as ``file_base + (line_indent - llm_base)``.
-@@ -227,22 +253,85 @@ def _reindent_replacement(file_region: str, old_string: str, new_string: str) ->
-     No-op cases (returns ``new_string`` unchanged):
-     - file_region or old_string has no meaningful line
-     - LLM base indent equals file base indent
-+    - file_region and old_string have different non-blank line counts
-+      (indentation comparison would be meaningless)
-+    - old_string has **inconsistent** indentation (non-blank lines span
-+      more than 2 distinct leading-whitespace widths) — reindentation
-+      would be unreliable, so skip it.
-     - new_string is empty
-     """
-     if not new_string:
-         return new_string
+-    2. Anchor that relative indent onto the file's actual base indent (the
+-       leading whitespace of the file_region's first non-blank line).
+-    3. Re-emit each non-blank line as ``file_base + (line_indent - llm_base)``.
++    Use this when you know new_string lost its indentation during
++    copy/paste (e.g. from a reject diff) and want to restore it from
++    the old_string reference.  ``fuzzy_find_and_replace``'s
++    ``fix_indent_from_old`` parameter calls this automatically.
  
--    old_first = _first_meaningful_line(old_string)
+-    Blank lines and lines less-indented than the LLM's base are anchored
+-    directly to the file's base indent.
+-
+-    No-op cases (returns ``new_string`` unchanged):
+-    - file_region or old_string has no meaningful line
+-    - LLM base indent equals file base indent
+-    - new_string is empty
++    Returns ``new_string`` unchanged when old_string has no indent or
++    new_string already has indent (nothing to fix).
+     """
+-    if not new_string:
+-        return new_string
+-
+     old_first = _first_meaningful_line(old_string)
 -    file_first = _first_meaningful_line(file_region)
 -    if old_first is None or file_first is None:
-+    # Line-count guard: if file_region and old_string have different
-+    # non-blank line counts, the fuzzy match may have hit wrong
-+    # boundaries. Skip re-indentation to avoid corrupting the file.
-+    _old_nb = sum(1 for ln in old_string.split("\n") if ln.strip())
-+    _file_nb = sum(1 for ln in file_region.split("\n") if ln.strip())
-+    if _old_nb != _file_nb:
-         return new_string
- 
--    old_indent = _leading_whitespace(old_first)
--    file_indent = _leading_whitespace(file_first)
-+    # Indentation-consistency guard: if old_string's non-blank lines
-+    # span more than 2 distinct leading-whitespace widths, something is
-+    # likely wrong with the match.  Skip reindentation to avoid
-+    # corrupting the file with an unreliable baseline.
-+    _old_lines = [ln for ln in old_string.split("\n") if ln.strip()]
-+    _old_indents = {_leading_whitespace(ln) for ln in _old_lines}
-+    if len(_old_indents) > 2:
-+        return new_string
- 
-+    # Use the MODE (most common) non-blank-line indent as the baseline,
-+    # not _first_meaningful_line.  LLM-generated old_strings often have
-+    # the first line at a different nesting level than the rest of the
-+    # block (comment continuation lines, etc.).
-+    _indent_counts: dict[str, int] = {}
-+    for ln in _old_lines:
-+        ws = _leading_whitespace(ln)
-+        _indent_counts[ws] = _indent_counts.get(ws, 0) + 1
-+    # Tie-break: prefer the shallowest among equally frequent indents
-+    # (the "base" indent is typically at or near the top of the block).
-+    _max_count = max(_indent_counts.values())
-+    _mode_indents = sorted(ws for ws, cnt in _indent_counts.items()
-+                          if cnt == _max_count)
-+    old_indent = _mode_indents[0]  # shallowest among the most common
-+
-+    file_first = _first_meaningful_line(file_region)
-+    if file_first is None:
-+        return new_string
-+    file_indent = _leading_whitespace(file_first)
-     if old_indent == file_indent:
-+        # Even when old_string matches the file's indent, new_string may use
-+        # different indentation (e.g. LLM lost leading whitespace on the
-+        # first line via tool-call serialization).  Compute new_string's own
-+        # base indent and re-indent to the file's actual indent when they
-+        # differ, so the replacement preserves the file's indent style.
-+        _new_lines = [ln for ln in new_string.split("\n") if ln.strip()]
-+        if _new_lines:
-+            _new_indent_counts: dict[str, int] = {}
-+            for ln in _new_lines:
-+                ws = _leading_whitespace(ln)
-+                _new_indent_counts[ws] = _new_indent_counts.get(ws, 0) + 1
-+            _new_max = max(_new_indent_counts.values())
-+            _new_mode = sorted(
-+                ws for ws, cnt in _new_indent_counts.items() if cnt == _new_max
-+            )
-+            new_indent = _new_mode[0]
-+            if new_indent != old_indent:
-+                # Re-indent to file's actual indent using new_string's own
-+                # base indent as the reference prefix.
-+                out_lines: list[str] = []
-+                for line in new_string.split("\n"):
-+                    if not line.strip():
-+                        out_lines.append(line)
-+                        continue
-+                    line_indent = _leading_whitespace(line)
-+                    if line_indent.startswith(new_indent):
-+                        remainder = line[len(new_indent):]
-+                        out_lines.append(file_indent + remainder)
-+                    else:
-+                        out_lines.append(file_indent + line.lstrip(" \t"))
-+                return "\n".join(out_lines)
++    if not old_first:
          return new_string
 -
-     # Re-indent each line of new_string. Strategy: replace the LLM's base
-     # indent prefix with the file's base indent prefix, preserving any
-     # additional indent the LLM added on top. This is the same approach
-@@ -336,6 +425,36 @@ def _apply_replacements(content: str, matches: List[Tuple[int, int]],
+     old_indent = _leading_whitespace(old_first)
+-    file_indent = _leading_whitespace(file_first)
+-
+-    if old_indent == file_indent:
++    if not old_indent:
+         return new_string
+ 
+-    # Re-indent each line of new_string. Strategy: replace the LLM's base
+-    # indent prefix with the file's base indent prefix, preserving any
+-    # additional indent the LLM added on top. This is the same approach
+-    # Roo Code uses (multi-search-replace.ts:466-500). It preserves the
+-    # LLM's intended *relative* nesting between lines while anchoring to
+-    # the file's actual indent style.
+-    out_lines: List[str] = []
+-    for line in new_string.split("\n"):
+-        if not line.strip():
+-            # Blank lines: leave whitespace untouched.
+-            out_lines.append(line)
+-            continue
+-        line_indent = _leading_whitespace(line)
+-        if line_indent.startswith(old_indent):
+-            # Common case: line has the LLM's base indent (possibly plus
+-            # extra). Swap base prefix for the file's base prefix.
+-            remainder = line[len(old_indent):]
+-            out_lines.append(file_indent + remainder)
++    # Check that new_string actually lost its indent
++    new_first = _first_meaningful_line(new_string)
++    if new_first and _leading_whitespace(new_first):
++        return new_string  # already has indent, nothing to fix
++
++    lines = new_string.split("\n")
++    out: list[str] = []
++    for line in lines:
++        if line.strip():
++            out.append(old_indent + line.lstrip(" \t"))
+         else:
+-            # Line is less-indented than the LLM's base — e.g. a dedent at
+-            # the start of new_string. Anchor to the file's base.
+-            out_lines.append(file_indent + line.lstrip(" \t"))
+-    return "\n".join(out_lines)
++            out.append(line)
++    return "\n".join(out)
+ 
+ 
+ def _maybe_unescape_new_string(new_string: str,
+@@ -305,37 +382,62 @@ def _maybe_unescape_new_string(new_string: str,
+ 
+ 
+ def _apply_replacements(content: str, matches: List[Tuple[int, int]],
+-                        new_string: str, old_string: Optional[str] = None) -> str:
+-    """
+-    Apply replacements at the given positions.
++                        new_string: str) -> str:
++    """Apply replacements at the given positions.
++
++    Direct replacement with no indentation auto-correction.
++    The caller (fuzzy_find_and_replace) handles first-line indent
++    preservation when old_string has leading whitespace.
+ 
+     Args:
+         content: Original content
+         matches: List of (start, end) positions to replace
+         new_string: Replacement text
+-        old_string: When non-None, signals that the match came from a
+-            non-exact fuzzy strategy; ``new_string`` is re-indented to
+-            match the file's actual indentation before substitution.
+ 
+     Returns:
+         Content with replacements applied
+     """
+     # Sort matches by position (descending) to replace from end to start
+-    # This preserves positions of earlier matches
+     sorted_matches = sorted(matches, key=lambda x: x[0], reverse=True)
+ 
+     result = content
+     for start, end in sorted_matches:
+-        if old_string is not None:
+-            file_region = content[start:end]
+-            adjusted = _reindent_replacement(file_region, old_string, new_string)
+-        else:
+-            adjusted = new_string
+-        result = result[:start] + adjusted + result[end:]
++        # Direct replacement covering the full matched region
++        # (including original first-line indentation)
++        result = result[:start] + new_string + result[end:]
+ 
      return result
  
  
-+
 +def _verify_match_content(content: str, matches: List[Tuple[int, int]],
 +                           old_string: str) -> bool:
 +    """Verify that the matched region of the file actually resembles old_string.
@@ -1896,11 +4241,109 @@ index b6991e7a2..f07f17533 100644
  # =============================================================================
  # Matching Strategies
  # =============================================================================
+diff --git a/tools/skill_manager_tool.py b/tools/skill_manager_tool.py
+index e3f48b2b6..c158dda8b 100644
+--- a/tools/skill_manager_tool.py
++++ b/tools/skill_manager_tool.py
+@@ -263,6 +263,82 @@ def _validate_name(name: str) -> Optional[str]:
+     return None
+ 
+ 
++def _auto_classify_skill(name: str, content: str) -> Optional[str]:
++    """Auto-classify a skill into an existing category based on keyword matching.
++
++    Matches the skill's name and frontmatter description against:
++      1. ``keywords:`` list in DESCRIPTION.md (strongest signal)
++      2. ``description:`` text in DESCRIPTION.md (fallback)
++      3. Category directory name (weakest signal)
++
++    Returns the best-matching category path (e.g. ``"mlops/inference"``) or None.
++    """
++    try:
++        import re
++        from pathlib import Path
++        from hermes_constants import get_skills_dir
++        from agent.skill_utils import parse_frontmatter
++
++        skills_dir = get_skills_dir()
++        if not skills_dir.exists():
++            return None
++
++        # Parse the new skill's frontmatter
++        # Ensure trailing newline so parse_frontmatter's regex can find closing ---
++        raw_content = (content or "").strip() + "\n"
++        fm, _ = parse_frontmatter(raw_content)
++        skill_desc = (fm.get("description") or "").lower()
++        skill_name = name.lower()
++        search_text = f"{skill_name} {skill_desc}"
++
++        best_category = None
++        best_score = 0
++
++        for desc_file in skills_dir.rglob("DESCRIPTION.md"):
++            if desc_file.parent == skills_dir:
++                continue
++            try:
++                desc_content = desc_file.read_text(encoding="utf-8")
++                desc_fm, _ = parse_frontmatter(desc_content)
++                rel = desc_file.parent.relative_to(skills_dir)
++                cat_path = str(rel.as_posix())
++
++                score = 0
++
++                # 1. Match against keywords (strongest)
++                keywords = desc_fm.get("keywords", []) or []
++                if isinstance(keywords, str):
++                    keywords = [keywords]
++                if isinstance(keywords, list):
++                    for kw in keywords:
++                        kw_lower = str(kw).strip().lower()
++                        if len(kw_lower) >= 3 and kw_lower in search_text:
++                            score += 3 if f" {kw_lower} " in f" {search_text} " else 1
++
++                # 2. Match against description text (fallback)
++                cat_desc = str(desc_fm.get("description", "") or "").lower()
++                for word in re.findall(r"[a-z]+", cat_desc):
++                    if len(word) >= 4 and word in search_text:
++                        score += 1
++
++                # 3. Match category directory name itself
++                cat_name_lower = cat_path.replace("/", " ").replace("-", " ").lower()
++                for word in cat_name_lower.split():
++                    if len(word) >= 3 and word in search_text:
++                        score += 2
++
++                if score > best_score:
++                    best_score = score
++                    best_category = cat_path
++
++            except Exception:
++                continue
++
++        return best_category if best_score >= 2 else None
++    except Exception:
++        return None
++
++
+ def _validate_category(category: Optional[str]) -> Optional[str]:
+     """Validate an optional category name used as a single directory segment."""
+     if category is None:
+@@ -1032,6 +1108,10 @@ def skill_manage(
+     if action == "create":
+         if not content:
+             return tool_error("content is required for 'create'. Provide the full SKILL.md text (frontmatter + body).", success=False)
++        # Auto-classify: if no category given, match against existing
++        # category keywords from DESCRIPTION.md files
++        if not category:
++            category = _auto_classify_skill(name, content)
+         result = _create_skill(name, content, category)
+ 
+     elif action == "edit":
 diff --git a/tools/skills_tool.py b/tools/skills_tool.py
-index 48274ccfe..d53c32624 100644
+index 2ba57adc5..a7872afbc 100644
 --- a/tools/skills_tool.py
 +++ b/tools/skills_tool.py
-@@ -742,10 +742,74 @@ def skills_list(category: str = None, task_id: str = None) -> str:
+@@ -749,10 +749,74 @@ def skills_list(category: str = None, task_id: str = None) -> str:
          )
  
      except Exception as e:
@@ -1977,7 +4420,7 @@ index 48274ccfe..d53c32624 100644
  
  
  def _serve_plugin_skill(
-@@ -1554,48 +1618,38 @@ SKILL_VIEW_SCHEMA = {
+@@ -1591,48 +1655,38 @@ SKILL_VIEW_SCHEMA = {
          },
          "required": ["name"],
      },
